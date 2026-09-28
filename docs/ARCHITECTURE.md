@@ -55,6 +55,8 @@ Claude ─► Market ─► Research ─► Decision ─► Risk ─► Executio
 | Promotion requires evidence | deterministic gate; tamper-evident record; registry accepts only intact approved records | `test_validation.py::TestPromotion` |
 | No risk bypass | execution verifies HMAC-signed, unexpired approvals from a per-process key | `test_risk.py::TestApprovalIntegrity`, `test_execution_ledger.py` |
 | Uncertain state stops trading | UNKNOWN order → halt; reconciliation required; account unknown → proposals refused | `test_chaos.py` |
+| Research criteria stay locked across restarts; multiple-testing count is historical | `ResearchLog` is rebuilt from the research journal (hash-verified); conflicting locks fail closed; count = distinct root hypotheses with ≥1 experiment | `test_research_memory_integrity.py::TestResearchPersistence`, `test_multiple_testing_penalty_uses_persistent_history` |
+| Non-market data never becomes doctrine; evidence is unique and independent | `MemoryStore` category gate (doctrine only in REAL/HISTORICAL/DELAYED stores), canonical-record checks, unique refs, holdout dataset ≠ development datasets, supersession needs new testing evidence, violating journal entries quarantined on reload | `test_research_memory_integrity.py` |
 | Claude output cannot command | closed schema, unknown keys rejected, no execution path | `test_claude_contract_security.py` |
 
 ## Decision pipeline (one trade candidate)

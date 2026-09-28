@@ -89,7 +89,9 @@ class AutonomousLoop:
             elif e.type == "stop_cleared":
                 self.stops.pop(p["symbol"], None)
             elif e.type == "mistake_flag":
-                self.mistake_flags.setdefault(p["fingerprint"], []).append(p["review_id"])
+                flags = self.mistake_flags.setdefault(p["fingerprint"], [])
+                if p["review_id"] not in flags:
+                    flags.append(p["review_id"])
 
     def _log(self, type_: str, payload: dict) -> None:
         self.journal.append(type_, payload)
@@ -268,11 +270,17 @@ class AutonomousLoop:
             fp = fingerprint(review.possible_mistake)
             self._log("mistake_flag", {"fingerprint": fp, "review_id": review_id})
             flags = self.mistake_flags.setdefault(fp, [])
-            flags.append(review_id)
+            if review_id not in flags:
+                flags.append(review_id)
             refs = tuple(s.evidence.resolve(r) for r in flags)
-            if len(flags) >= 2:
+            if len(set(flags)) >= 2 and s.memory.accepts_doctrine:
                 entry = MemoryEntry(MemoryKind.MISTAKE, review.possible_mistake, now, "claude:post_trade_reviewer",
                                     refs, 0.6)
+            elif len(set(flags)) >= 2:
+                # Non-market data (e.g. MOCK): keep the learning, never as doctrine.
+                entry = MemoryEntry(MemoryKind.HYPOTHESIS,
+                                    f"[{s.memory.data_status}, not doctrine] recurring possible mistake: "
+                                    f"{review.possible_mistake}", now, "claude:post_trade_reviewer", refs, 0.3)
             else:
                 entry = MemoryEntry(MemoryKind.HYPOTHESIS, f"possible mistake: {review.possible_mistake}", now,
                                     "claude:post_trade_reviewer", refs, 0.3)

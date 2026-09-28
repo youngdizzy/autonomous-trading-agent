@@ -8,7 +8,8 @@ from ati.core.time import FixedClock
 from ati.decision.records import DecisionLog, DecisionRecord, FinalDecision, make_decision_id
 from ati.ledger.journal import Journal
 from ati.memory.evidence import EvidenceRef, EvidenceRegistry
-from ati.memory.store import MemoryEntry, MemoryKind, MemoryStore
+from ati.core.errors import MemoryIntegrityError
+from ati.memory.store import MemoryEntry, MemoryKind, MemoryStore, _check_independence, _evidence_ok
 from tests.helpers import T0
 
 T1 = T0 + timedelta(days=1)
@@ -62,12 +63,23 @@ class TestMemory:
             mem.add(entry(kind, refs, conf=0.3))
 
     def test_validated_finding_requires_full_chain(self, mem, reg):
+        # 1.1: this store has no data category (attrs={}), so doctrine is refused outright (defect B4).
         refs = [reg.register(k, k, T0) for k in ("walk_forward", "holdout", "adversarial")]
-        mem.add(entry(MemoryKind.VALIDATED_FINDING, refs, conf=0.6))
+        with pytest.raises(MemoryIntegrityError):
+            mem.add(entry(MemoryKind.VALIDATED_FINDING, refs, conf=0.6))
+        # The structural chain itself (all three kinds, independent datasets) is satisfied by canonical refs:
+        chain = [EvidenceRef("walk_forward", "w", T0, dataset_id="ds_dev"),
+                 EvidenceRef("adversarial", "a", T0, dataset_id="ds_dev", strategy="s1"),
+                 EvidenceRef("holdout", "h", T0, dataset_id="ds_hold", strategy="s1")]
+        assert _evidence_ok(MemoryKind.VALIDATED_FINDING, tuple(chain)) is None
+        _check_independence(chain)
 
     def test_mistake_requires_recurrence(self, mem, reg):
         refs = [reg.register("trade_review", f"r{i}", T0) for i in range(2)]
-        mem.add(entry(MemoryKind.MISTAKE, refs, conf=0.5))
+        assert _evidence_ok(MemoryKind.MISTAKE, tuple(refs)) is None       # two distinct reviews: recurring
+        assert _evidence_ok(MemoryKind.MISTAKE, tuple(refs[:1])) is not None
+        with pytest.raises(MemoryIntegrityError):                          # 1.1: no doctrine in a category-less store
+            mem.add(entry(MemoryKind.MISTAKE, refs, conf=0.5))
 
     def test_rejected_hypotheses_retained_and_found(self, tmp_path, mem, reg, clock):
         ref = reg.register("experiment", "e-bad", T0)
@@ -81,8 +93,8 @@ class TestMemory:
     def test_supersession_preserves_history(self, mem, reg):
         first = mem.add(entry(MemoryKind.HYPOTHESIS, conf=0.2, at=T0 + timedelta(hours=1)))
         ref = reg.register("experiment", "e2", T0 + timedelta(hours=2))
-        mem.add(entry(MemoryKind.FINDING, [ref], conf=0.5, at=T0 + timedelta(hours=3), supersedes=first))
-        assert [e.kind for e in mem.query(T1)] == [MemoryKind.FINDING]
+        mem.add(entry(MemoryKind.REJECTED_HYPOTHESIS, [ref], conf=0.5, at=T0 + timedelta(hours=3), supersedes=first))
+        assert [e.kind for e in mem.query(T1)] == [MemoryKind.REJECTED_HYPOTHESIS]
         assert len(mem.query(T1, include_superseded=True)) == 2
         with pytest.raises(LifecycleError):
             mem.add(entry(MemoryKind.HYPOTHESIS, conf=0.1, statement="other", supersedes=first))

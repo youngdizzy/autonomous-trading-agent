@@ -15,6 +15,23 @@ Kinds and their evidence requirements (enforced):
 | LESSON               | behavioral lesson that survived testing        | >=1 experiment/walk_forward/holdout      | 0.8            |
 
 Queries are point-in-time: ``query(as_of=T)`` only returns entries available at or before T.
+
+Integrity rules (Research & Memory Integrity 1.1), checked on ``add`` and re-checked on every reload:
+
+- Category gate: the store's category is the ``data_status`` its journal is bound to, and must equal
+  the evidence registry's. Doctrinal kinds (FINDING, VALIDATED_FINDING, MISTAKE, LESSON) are accepted
+  only in a market-evidence store (REAL, HISTORICAL, DELAYED). MOCK, SYNTHETIC, UNKNOWN or any other
+  category may hold HYPOTHESIS and REJECTED_HYPOTHESIS only. Nothing is silently downgraded.
+- Evidence is judged by its canonical registry record, never by caller-supplied metadata; every
+  cited ref must equal its registration, and one ref may be cited only once.
+- Independence: a VALIDATED_FINDING needs walk_forward, holdout and adversarial evidence that all carry
+  dataset identities; the holdout dataset must differ from every development dataset cited, and the
+  holdout and adversarial evidence must concern the same strategy identity. Missing identity fails.
+- Dataset claims: an entry may only list dataset ids that its canonical evidence actually carries.
+- Supersession: a VALIDATED_FINDING can only be superseded by an entry citing new testing evidence
+  (experiment, walk_forward or holdout not cited by the finding it replaces).
+- Entries in the journal that violate these rules (e.g. written by older code) are quarantined on
+  reload: they stay in the immutable journal but are never returned by queries.
 """
 
 from __future__ import annotations
@@ -25,7 +42,7 @@ from datetime import datetime
 from enum import Enum
 
 from ati.core.canonical import sha256_hex, sha256_text
-from ati.core.errors import LifecycleError, LookaheadError
+from ati.core.errors import LifecycleError, LookaheadError, MemoryIntegrityError, ProvenanceError
 from ati.core.time import ensure_utc
 from ati.ledger.journal import Journal, decode
 from ati.memory.evidence import EvidenceRef, EvidenceRegistry
@@ -46,6 +63,8 @@ CONFIDENCE_CAP = {
 }
 
 _TESTING = {"experiment", "walk_forward", "holdout", "adversarial"}
+MARKET_CATEGORIES = frozenset({"REAL", "HISTORICAL", "DELAYED"})
+DOCTRINAL = frozenset({"FINDING", "VALIDATED_FINDING", "MISTAKE", "LESSON"})
 
 
 def _evidence_ok(kind: MemoryKind, refs: tuple[EvidenceRef, ...]) -> str | None:
@@ -61,6 +80,34 @@ def _evidence_ok(kind: MemoryKind, refs: tuple[EvidenceRef, ...]) -> str | None:
     if kind is MemoryKind.LESSON and not set(kinds) & {"experiment", "walk_forward", "holdout"}:
         return "LESSON requires experiment, walk_forward or holdout evidence"
     return None
+
+
+def _check_independence(refs: list[EvidenceRef]) -> None:
+    """Holdout confirmation must come from a dataset distinct from all development evidence."""
+    holdouts = [r for r in refs if r.kind == "holdout"]
+    development = [r for r in refs if r.kind in ("walk_forward", "adversarial", "experiment")]
+    for r in holdouts + development:
+        if not r.dataset_id:
+            raise MemoryIntegrityError(f"{r.kind} evidence {r.ref_id} has no dataset identity; independence unverifiable")
+    dev_datasets = {r.dataset_id for r in development}
+    for h in holdouts:
+        if h.dataset_id in dev_datasets:
+            raise MemoryIntegrityError("holdout evidence uses a development dataset; not independent confirmation")
+    adversarial = [r for r in refs if r.kind == "adversarial"]
+    if not holdouts or not adversarial:
+        raise MemoryIntegrityError("validated finding requires holdout and adversarial evidence")
+    for h in holdouts:
+        if not h.strategy or any(a.strategy != h.strategy for a in adversarial):
+            raise MemoryIntegrityError("holdout and adversarial evidence do not concern the same strategy")
+
+
+def _check_validated_supersession(old: "MemoryEntry", new_refs: list[EvidenceRef]) -> None:
+    """A validated conclusion is replaced only by *new* testing evidence, never by opinion."""
+    if old.kind is not MemoryKind.VALIDATED_FINDING:
+        return
+    old_ids = {r.ref_id for r in old.evidence}
+    if not any(r.kind in ("experiment", "walk_forward", "holdout") and r.ref_id not in old_ids for r in new_refs):
+        raise LifecycleError("validated knowledge can only be superseded by new testing evidence")
 
 
 def fingerprint(statement: str, strategy_kind: str = "") -> str:
@@ -107,26 +154,56 @@ class MemoryStore:
     def __init__(self, journal: Journal, evidence: EvidenceRegistry):
         self.journal = journal
         self.evidence = evidence
+        self.data_status: str = str(journal.attrs.get("data_status", "UNKNOWN"))
+        if self.data_status != evidence.data_status:
+            raise ProvenanceError(f"memory journal is {self.data_status} but evidence registry is {evidence.data_status}")
         self._entries: dict[str, MemoryEntry] = {}
         self._superseded: set[str] = set()
+        self.quarantined: dict[str, str] = {}
         for entry in journal.entries("memory"):
             p = decode(entry.payload)["entry"]
             m = MemoryEntry(MemoryKind(p["kind"]), p["statement"], p["created_at"], p["provenance"],
-                            tuple(EvidenceRef(e["kind"], e["ref_id"], e["available_at"]) for e in p["evidence"]),
+                            tuple(EvidenceRef(e["kind"], e["ref_id"], e["available_at"], e.get("data_status", "UNKNOWN"),
+                                              e.get("dataset_id"), e.get("strategy")) for e in p["evidence"]),
                             p["confidence"], tuple(p["dataset_ids"]), tuple(p["strategy_keys"]), p["strategy_kind"],
                             p["supersedes"], p["lifecycle"])
+            try:
+                self._validate(m)  # restart never weakens validation
+            except (MemoryIntegrityError, LifecycleError, KeyError, ValueError) as exc:
+                self.quarantined[m.entry_id] = str(exc)
+                continue
             self._entries[m.entry_id] = m
             if m.supersedes:
                 self._superseded.add(m.supersedes)
 
-    def add(self, entry: MemoryEntry) -> str:
+    @property
+    def accepts_doctrine(self) -> bool:
+        return self.data_status in MARKET_CATEGORIES
+
+    def _validate(self, entry: MemoryEntry) -> None:
+        ids = [r.ref_id for r in entry.evidence]
+        if len(ids) != len(set(ids)):
+            raise MemoryIntegrityError("duplicate evidence reference: each piece of evidence may be cited once")
+        canonical = []
         for ref in entry.evidence:
             registered = self.evidence.resolve(ref.ref_id)  # KeyError → fabricated evidence
             if registered != ref:
-                raise ValueError(f"evidence {ref.ref_id} does not match its registration")
-        problem = _evidence_ok(entry.kind, entry.evidence)
+                raise MemoryIntegrityError(f"evidence {ref.ref_id} does not match its canonical registration")
+            canonical.append(registered)
+        if entry.kind.value in DOCTRINAL:
+            if not self.accepts_doctrine:
+                raise MemoryIntegrityError(f"{entry.kind.value} is institutional doctrine; a {self.data_status} store "
+                                           "may only hold HYPOTHESIS or REJECTED_HYPOTHESIS")
+            if any(r.data_status not in MARKET_CATEGORIES for r in canonical):
+                raise MemoryIntegrityError("doctrine may only cite market-evidence records")
+            evidenced = {r.dataset_id for r in canonical if r.dataset_id}
+            if not set(entry.dataset_ids) <= evidenced:
+                raise MemoryIntegrityError("entry lists dataset ids its evidence does not carry")
+        problem = _evidence_ok(entry.kind, tuple(canonical))
         if problem:
-            raise ValueError(problem)
+            raise MemoryIntegrityError(problem)
+        if entry.kind is MemoryKind.VALIDATED_FINDING:
+            _check_independence(canonical)
         if entry.supersedes is not None:
             if entry.supersedes not in self._entries:
                 raise LifecycleError(f"cannot supersede unknown entry {entry.supersedes}")
@@ -136,6 +213,10 @@ class MemoryStore:
             if old.kind is MemoryKind.REJECTED_HYPOTHESIS and entry.kind is not MemoryKind.REJECTED_HYPOTHESIS:
                 if not {r.kind for r in entry.evidence} & {"holdout", "walk_forward"}:
                     raise LifecycleError("a rejected hypothesis can only be revived with new out-of-sample evidence")
+            _check_validated_supersession(old, canonical)
+
+    def add(self, entry: MemoryEntry) -> str:
+        self._validate(entry)
         if entry.entry_id in self._entries:
             return entry.entry_id
         self.journal.append("memory", {"entry_id": entry.entry_id, "entry": entry})

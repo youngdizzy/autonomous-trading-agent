@@ -40,6 +40,14 @@ class StrategyImmutableError(AtiError):
     """An attempt was made to change a registered strategy definition in place."""
 
 
+class ResearchIntegrityError(AtiError):
+    """The research journal contradicts itself (e.g. two different pre-registrations for one id)."""
+
+
+class MemoryIntegrityError(AtiError, ValueError):
+    """A memory record is not supported by independent, correctly categorised canonical evidence."""
+
+
 class LifecycleError(AtiError):
     """Illegal strategy / memory lifecycle transition."""
 

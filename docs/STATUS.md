@@ -38,7 +38,8 @@ Vocabulary is exact. Nothing below is upgraded from one state to another.
 | Paper venue | IMPLEMENTED (prices from whatever data feeds it; currently MOCK only) |
 | Paper trading on REAL market data | BLOCKED — ENVIRONMENT CAPABILITY (no market data reachable); the same adapter→archive→loop→paper path is verified with a Kraken-shaped MOCK feed |
 | Live broker adapter | NOT IMPLEMENTED; LIVE_TRADING = false |
-| Structured memory + evidence registry | IMPLEMENTED |
+| Structured memory + evidence registry (1.1: category gate, unique + independent evidence, quarantine on reload) | IMPLEMENTED |
+| Research log persistence (1.1: locked criteria and hypothesis count survive restarts) | IMPLEMENTED |
 | Claude output schema, roles, MOCK and file-exchange reasoning clients | IMPLEMENTED |
 | Direct Claude API reasoning client | NOT IMPLEMENTED (BLOCKED — CREDENTIALS) |
 | Autonomous loop (resumable tick) | IMPLEMENTED |

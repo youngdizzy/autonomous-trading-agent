@@ -15,9 +15,9 @@ from datetime import datetime
 from enum import Enum
 
 from ati.core.canonical import sha256_hex
-from ati.core.errors import LifecycleError
+from ati.core.errors import LifecycleError, ResearchIntegrityError
 from ati.core.time import ensure_utc
-from ati.ledger.journal import Journal
+from ati.ledger.journal import Journal, decode
 from ati.research.metrics import Metrics
 
 _OPS = {">": operator.gt, ">=": operator.ge, "<": operator.lt, "<=": operator.le}
@@ -84,20 +84,57 @@ class PreRegistration:
         return Verdict.PASS, details
 
 
+def root_hypothesis_id(hypothesis_id: str) -> str:
+    """``H1:holdout`` is stage ``holdout`` of hypothesis ``H1``; the root identifies the hypothesis."""
+    return hypothesis_id.split(":", 1)[0]
+
+
 class ResearchLog:
-    """Journal-backed record of every pre-registration and every experiment, including failures."""
+    """Journal-backed record of every pre-registration and every experiment, including failures.
+
+    The research journal is the only source of truth. Constructing a ``ResearchLog`` over an existing
+    journal reconstructs all pre-registrations (verifying each stored ``prereg_hash``) and all
+    experiments, so a process restart cannot unlock criteria or forget history. A journal that holds
+    two different pre-registrations for one hypothesis id is corrupt and fails closed.
+
+    Counting rule (multiple-testing penalty): ``hypotheses_tested`` is the number of distinct *root*
+    hypotheses (id before the first ``:``) that have at least one recorded experiment, whatever its
+    verdict. Pre-registered but never-tested hypotheses do not count; stages of one hypothesis
+    (e.g. ``H1`` and ``H1:holdout``) count once.
+    """
 
     def __init__(self, journal: Journal):
         self.journal = journal
         self._prereg: dict[str, PreRegistration] = {}
         self._experiments: list[dict] = []
+        for entry in journal.entries():
+            if entry.type == "preregistration":
+                prereg = _prereg_from_payload(decode(entry.payload)["prereg"])
+                if prereg.prereg_hash != entry.payload["prereg_hash"]:
+                    raise ResearchIntegrityError(f"{prereg.hypothesis_id}: journaled prereg_hash does not match content")
+                existing = self._prereg.get(prereg.hypothesis_id)
+                if existing is not None and existing.prereg_hash != prereg.prereg_hash:
+                    raise ResearchIntegrityError(f"{prereg.hypothesis_id}: journal holds conflicting pre-registrations")
+                self._prereg[prereg.hypothesis_id] = prereg
+            elif entry.type == "experiment":
+                row = decode(entry.payload)
+                prereg = self._prereg.get(row["hypothesis_id"])
+                if prereg is None or prereg.prereg_hash != row["prereg_hash"]:
+                    raise ResearchIntegrityError(f"experiment for {row['hypothesis_id']} does not match a locked pre-registration")
+                self._experiments.append(row)
 
     def preregister(self, prereg: PreRegistration) -> str:
         existing = self._prereg.get(prereg.hypothesis_id)
         if existing is not None:
             if existing.prereg_hash != prereg.prereg_hash:
-                raise LifecycleError(f"{prereg.hypothesis_id} already pre-registered with different criteria")
+                raise LifecycleError(f"{prereg.hypothesis_id} already pre-registered with different criteria; "
+                                     "a different hypothesis needs a new id")
             return existing.prereg_hash
+        root = root_hypothesis_id(prereg.hypothesis_id)
+        if root != prereg.hypothesis_id:
+            parent = self._prereg.get(root)
+            if parent is None or parent.statement != prereg.statement:
+                raise LifecycleError(f"stage {prereg.hypothesis_id} requires pre-registered root {root} with the same statement")
         self.journal.append("preregistration", {"prereg": prereg, "prereg_hash": prereg.prereg_hash})
         self._prereg[prereg.hypothesis_id] = prereg
         return prereg.prereg_hash
@@ -111,17 +148,36 @@ class ResearchLog:
         row = {"hypothesis_id": hypothesis_id, "prereg_hash": prereg.prereg_hash, "stage": stage,
                "evidence_hash": evidence_hash, "dataset_id": dataset_id, "metrics": metrics,
                "verdict": verdict, "details": details}
-        self.journal.append("experiment", row)
-        self._experiments.append(row)
+        written = self.journal.append("experiment", row)
+        self._experiments.append(decode(written.payload))
         return verdict
 
     def get(self, hypothesis_id: str) -> PreRegistration:
         return self._prereg[hypothesis_id]
 
+    def was_tested(self, hypothesis_id: str) -> bool:
+        root = root_hypothesis_id(hypothesis_id)
+        return any(root_hypothesis_id(e["hypothesis_id"]) == root for e in self._experiments)
+
+    def status(self, hypothesis_id: str) -> str:
+        """UNKNOWN | PREREGISTERED | TESTED:<verdict of latest experiment>."""
+        if hypothesis_id not in self._prereg:
+            return "UNKNOWN"
+        rows = [e for e in self._experiments if e["hypothesis_id"] == hypothesis_id]
+        return f"TESTED:{rows[-1]['verdict']}" if rows else "PREREGISTERED"
+
     @property
     def hypotheses_tested(self) -> int:
-        return len(self._prereg)
+        return len({root_hypothesis_id(e["hypothesis_id"]) for e in self._experiments})
 
     @property
     def experiments(self) -> tuple[dict, ...]:
         return tuple(self._experiments)
+
+
+def _prereg_from_payload(p: dict) -> PreRegistration:
+    return PreRegistration(
+        hypothesis_id=p["hypothesis_id"], statement=p["statement"], observation_refs=tuple(p["observation_refs"]),
+        strategy_key=p["strategy_key"], strategy_hash=p["strategy_hash"], dev_dataset_id=p["dev_dataset_id"],
+        criteria=tuple(Criterion(c["metric"], c["op"], c["threshold"]) for c in p["criteria"]),
+        min_trades=p["min_trades"], locked_at=p["locked_at"])

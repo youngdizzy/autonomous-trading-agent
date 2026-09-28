@@ -71,7 +71,7 @@ def research_preconditions(system, full: Dataset, base: StrategyDefinition, *, h
         full.require_not_holdout("research cycle")
     except Exception as exc:
         failures.append(str(exc))
-    if any(e.payload.get("hypothesis_id") == hypothesis_id for e in s.research_journal.entries("experiment")):
+    if ResearchLog(s.research_journal).was_tested(hypothesis_id):  # reconstructed from the journal
         failures.append(f"{hypothesis_id} was already tested; a hypothesis is run exactly once")
     return failures
 
@@ -100,17 +100,20 @@ def run_research_cycle(system, full: Dataset, boundary: datetime, *, hypothesis_
         journal.append("research_note", {"hypothesis_id": hypothesis_id, "note": "idea previously rejected",
                                          "prior": [p.entry_id for p in prior]})
 
-    s.evidence.register("dataset", full.dataset_id, full.identity.temporal_boundary, "research dataset")
+    s.evidence.register("dataset", full.dataset_id, full.identity.temporal_boundary, "research dataset",
+                        dataset_id=full.dataset_id)
     vault = HoldoutVault(full, boundary, journal, max_evaluations=1)
     dev = vault.development
-    s.evidence.register("dataset", dev.dataset_id, dev.identity.temporal_boundary, "development partition")
+    s.evidence.register("dataset", dev.dataset_id, dev.identity.temporal_boundary, "development partition",
+                        dataset_id=dev.dataset_id)
 
     prereg = PreRegistration(hypothesis_id, statement, (), base.key, base.definition_hash, dev.dataset_id, criteria,
                              adversarial_policy.min_oos_trades, now)
     log.preregister(prereg)
 
     wf = walk_forward(base, dev, grid, train_bars=train_bars, test_bars=test_bars, config=config)
-    s.evidence.register("walk_forward", wf.evidence_hash, now, f"{base.kind} walk-forward on {dev.dataset_id}")
+    s.evidence.register("walk_forward", wf.evidence_hash, now, f"{base.kind} walk-forward on {dev.dataset_id}",
+                        dataset_id=wf.dataset_id, strategy=base.strategy_id)
     dev_verdict = log.record_experiment(hypothesis_id, "walk_forward_oos", wf.evidence_hash, wf.oos_metrics, dev.dataset_id)
 
     def remember(kind: MemoryKind, text: str, refs: list[str], confidence: float) -> str:
@@ -131,14 +134,16 @@ def run_research_cycle(system, full: Dataset, boundary: datetime, *, hypothesis_
         s.strategies.transition(challenger.key, Lifecycle.CHALLENGER, f"survived development for {hypothesis_id}")
 
     adv = challenge(challenger, dev, config, wf, log.hypotheses_tested, adversarial_policy)
-    s.evidence.register("adversarial", adv.evidence_hash, now, "adversarial challenge")
+    s.evidence.register("adversarial", adv.evidence_hash, now, "adversarial challenge",
+                        dataset_id=adv.dataset_id, strategy=challenger.definition_hash)
     journal.append("adversarial_report", {"report": adv, "evidence_hash": adv.evidence_hash})
 
     hold_prereg = PreRegistration(hypothesis_id + ":holdout", statement, (), challenger.key, challenger.definition_hash,
                                   dev.dataset_id, criteria, promotion_policy.min_holdout_trades, now)
     log.preregister(hold_prereg)
     hold = vault.evaluate(challenger, hold_prereg, config)
-    s.evidence.register("holdout", hold.evidence_hash, now, "holdout evaluation")
+    s.evidence.register("holdout", hold.evidence_hash, now, "holdout evaluation",
+                        dataset_id=hold.holdout_dataset_id, strategy=challenger.definition_hash)
     log.record_experiment(hold_prereg.hypothesis_id, "holdout", hold.evidence_hash, hold.metrics, hold.holdout_dataset_id)
 
     champion = s.strategies.champion()
