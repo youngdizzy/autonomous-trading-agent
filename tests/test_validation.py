@@ -91,6 +91,36 @@ class TestHoldoutStructure:
         ev = vault.evaluate(s, prereg(vault, s))
         assert ev.metrics.n_trades >= 0 and ev.evaluation_number == 1
 
+    def test_original_full_dataset_cannot_be_used_after_sealing(self, vault, full):
+        """Keeping a reference to the FULL dataset must not open a side door into the holdout."""
+        from ati.research.robustness import parameter_perturbation
+        from ati.research.backtest import BacktestConfig
+        with pytest.raises(HoldoutViolation):
+            walk_forward(trend(), full, [P], train_bars=600, test_bars=300)
+        with pytest.raises(HoldoutViolation):
+            run_backtest(trend(), full)
+        with pytest.raises(HoldoutViolation):
+            parameter_perturbation(trend(), full, BacktestConfig())
+        run_backtest(trend(), vault.development)  # development data remains usable
+
+    def test_seal_survives_restart(self, tmp_path, full):
+        from ati.data.dataset import _clear_sealed_ranges_for_tests
+        from tests.rig import make_system
+        s, _ = make_system(tmp_path / "st")
+        HoldoutVault(full, full.candles[1500].open_time, s.research_journal)
+        _clear_sealed_ranges_for_tests()  # simulate a new process
+        make_system(tmp_path / "st")      # startup restores seals from the research journal
+        with pytest.raises(HoldoutViolation):
+            run_backtest(trend(), full)
+
+    def test_holdout_bypass_token_is_vault_private(self):
+        from pathlib import Path
+        root = Path(__file__).resolve().parents[1] / "ati"
+        users = sorted(p.name for p in root.rglob("*.py") if "_VAULT_TOKEN" in p.read_text())
+        assert users == ["backtest.py", "holdout.py"]
+        with pytest.raises(HoldoutViolation):
+            run_backtest(trend(), mock_dataset(2000).split(T0 + timedelta(hours=1500))[1], holdout_token=object())
+
     def test_optimizers_refuse_holdout_partition(self, full):
         _, hold = full.split(full.candles[1500].open_time)
         with pytest.raises(HoldoutViolation):

@@ -95,8 +95,10 @@ class _Pending:
 
 
 def run_backtest(strategy: StrategyDefinition, dataset: Dataset, config: BacktestConfig = BacktestConfig(),
-                 *, trade_start: datetime | None = None, allow_holdout: bool = False) -> BacktestResult:
-    if not allow_holdout:
+                 *, trade_start: datetime | None = None, holdout_token: object = None) -> BacktestResult:
+    from ati.validation.holdout import _VAULT_TOKEN  # only the vault module holds this object
+
+    if holdout_token is not _VAULT_TOKEN:
         dataset.require_not_holdout("run_backtest")
     dataset.verify()
     candles = dataset.candles

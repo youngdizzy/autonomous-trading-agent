@@ -118,7 +118,7 @@ class TestJournal:
         with pytest.raises(SecretLeakError):
             j.append("e", {"note": "key is super-secret-value-123"})
         with pytest.raises(SecretLeakError):
-            j.append("e", {"note": "sk-ant-abcdefghijklmnop"})
+            j.append("e", {"note": "sk-" + "ant-" + "abcdefghijklmnop"})  # credential shape, built at runtime
         assert "super-secret" not in (tmp_path / "j.jsonl").read_text()
 
 

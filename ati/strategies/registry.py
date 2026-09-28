@@ -65,7 +65,7 @@ class StrategyRegistry:
 
     def _log(self, key: str, old: str, new: str, why: str) -> None:
         self._history.append((key, old, new, why))
-        if self.journal:
+        if self.journal is not None:
             self.journal.append("strategy_lifecycle", {"key": key, "from": old, "to": new, "reason": why})
 
     def register(self, definition: StrategyDefinition) -> StrategyDefinition:
@@ -76,7 +76,7 @@ class StrategyRegistry:
             return existing
         self._defs[definition.key] = definition
         self._state[definition.key] = Lifecycle.CANDIDATE
-        if self.journal:
+        if self.journal is not None:
             self.journal.append("strategy_registered", {"key": definition.key, "definition_hash": definition.definition_hash,
                                                          "definition": definition})
         self._log(definition.key, "-", Lifecycle.CANDIDATE.value, "registered")

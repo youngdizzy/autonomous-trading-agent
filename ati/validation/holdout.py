@@ -26,12 +26,15 @@ from datetime import datetime
 
 from ati.core.canonical import sha256_hex
 from ati.core.errors import HoldoutViolation
-from ati.data.dataset import Dataset, DatasetIdentity, Partition
+from ati.data.dataset import Dataset, DatasetIdentity, Partition, seal_holdout_range
 from ati.ledger.journal import Journal
 from ati.research.backtest import BacktestConfig, run_backtest
 from ati.research.hypothesis import PreRegistration, Verdict
 from ati.research.metrics import Metrics, compute_metrics
 from ati.strategies.base import StrategyDefinition
+
+
+_VAULT_TOKEN = object()  # capability passed to the backtester only from HoldoutVault.evaluate
 
 
 @dataclass(frozen=True)
@@ -58,6 +61,7 @@ class HoldoutVault:
         if full.partition is not Partition.FULL:
             raise HoldoutViolation("vault must be built from a FULL dataset")
         dev, hold = full.split(boundary)
+        seal_holdout_range(hold.identity)  # from now on, nothing overlapping this period is research input
         self.__holdout = hold
         self._development = dev
         self._journal = journal
@@ -65,7 +69,8 @@ class HoldoutVault:
         self._evaluated_lineages: set[str] = set()
         self._evaluations = 0
         self._boundary = boundary
-        journal.append("holdout_sealed", {"development": dev.identity, "holdout_commitment": hold.identity.content_sha256,
+        journal.append("holdout_sealed", {"development": dev.identity, "holdout_identity": hold.identity,
+                                          "holdout_commitment": hold.identity.content_sha256,
                                           "holdout_dataset_id": hold.dataset_id, "boundary": boundary,
                                           "max_evaluations": max_evaluations})
 
@@ -106,7 +111,7 @@ class HoldoutVault:
         warm = self._development.candles[-strategy.lookback:]
         combined = Dataset.build(warm + hold.candles, data_version=hold.identity.data_version,
                                  realization=hold.identity.realization, partition=Partition.HOLDOUT)
-        result = run_backtest(strategy, combined, config, trade_start=hold.identity.start, allow_holdout=True)
+        result = run_backtest(strategy, combined, config, trade_start=hold.identity.start, holdout_token=_VAULT_TOKEN)
         result.trades[:] = [t for t in result.trades if t.decided_at >= hold.identity.start]
         metrics = compute_metrics(result, strategy.timeframe.bars_per_year)
         verdict, details = prereg.evaluate(metrics)

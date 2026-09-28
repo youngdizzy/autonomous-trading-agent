@@ -16,7 +16,8 @@ from ati.core.time import Clock
 from ati.decision.records import DecisionLog
 from ati.execution.engine import ExecutionEngine
 from ati.execution.paper import PaperBroker, Quote
-from ati.ledger.journal import Journal
+from ati.data.dataset import DatasetIdentity, Partition, seal_holdout_range
+from ati.ledger.journal import Journal, decode
 from ati.market.models import DataStatus, Timeframe
 from ati.market.provider import MarketDataProvider
 from ati.market.store import CandleStore
@@ -89,6 +90,10 @@ def build_paper_system(state_dir: Path | str, clock: Clock, provider: MarketData
     memory = MemoryStore(Journal(state / "memory.jsonl", kind="memory", attrs=attrs, clock=clock, guard=guard), evidence)
     decisions = DecisionLog(Journal(state / "decisions.jsonl", kind="decisions", attrs=attrs, clock=clock, guard=guard), evidence)
     research_journal = Journal(state / "research.jsonl", kind="research", attrs=attrs, clock=clock, guard=guard)
+    for entry in research_journal.entries("holdout_sealed"):  # sealed holdout periods survive restarts
+        h = decode(entry.payload)["holdout_identity"]
+        seal_holdout_range(DatasetIdentity(**(h | {"timeframe": Timeframe(h["timeframe"]), "status": DataStatus(h["status"]),
+                                                   "partition": Partition(h["partition"])})))
     strategies = StrategyRegistry(research_journal)
     pipeline = DecisionPipeline(clock=clock, universe=universe, risk=risk, execution=execution, decisions=decisions,
                                 evidence=evidence, memory=memory, reasoning=reasoning, guard=guard)

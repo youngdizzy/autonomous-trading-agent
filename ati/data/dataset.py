@@ -140,8 +140,13 @@ class Dataset:
         return PointInTimeView(self._candles[start:end], cutoff, self.dataset_id)
 
     def require_not_holdout(self, purpose: str) -> None:
+        """Refuse HOLDOUT partitions *and* any dataset whose bars overlap a sealed holdout period,
+        so keeping a reference to the original FULL dataset does not open a side door."""
         if self.partition is Partition.HOLDOUT:
             raise HoldoutViolation(f"{purpose} may not use HOLDOUT dataset {self.dataset_id}")
+        sealed = overlapping_sealed_range(self.identity)
+        if sealed is not None:
+            raise HoldoutViolation(f"{purpose}: dataset {self.dataset_id} overlaps sealed holdout period {sealed}")
 
     def split(self, boundary: datetime) -> tuple["Dataset", "Dataset"]:
         """Split into (DEVELOPMENT: close_time <= boundary, HOLDOUT: open_time >= boundary).
@@ -204,6 +209,30 @@ class Dataset:
         if ds.dataset_id != doc["dataset_id"] or (expected_id and ds.dataset_id != expected_id):
             raise DatasetIntegrityError(f"{path}: dataset id mismatch")
         return ds
+
+
+# --- sealed holdout periods ---------------------------------------------------------------------
+# Process-wide register of holdout periods sealed by a HoldoutVault (restored from the research
+# journal on startup by ``ati.system``). Keyed by series identity so unrelated series are unaffected.
+_SEALED: list[tuple[str, str, Timeframe, str, datetime, datetime]] = []
+
+
+def seal_holdout_range(identity: DatasetIdentity) -> None:
+    key = (identity.provider, identity.symbol, identity.timeframe, identity.realization, identity.start, identity.end)
+    if key not in _SEALED:
+        _SEALED.append(key)
+
+
+def overlapping_sealed_range(identity: DatasetIdentity) -> tuple | None:
+    for provider, symbol, tf, realization, start, end in _SEALED:
+        if (identity.provider, identity.symbol, identity.timeframe, identity.realization) == (provider, symbol, tf, realization) \
+                and identity.start < end and identity.end > start:
+            return (symbol, tf.value, start.isoformat(), end.isoformat())
+    return None
+
+
+def _clear_sealed_ranges_for_tests() -> None:
+    _SEALED.clear()
 
 
 class DatasetRegistry:
