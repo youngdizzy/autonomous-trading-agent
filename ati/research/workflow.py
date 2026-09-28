@@ -37,6 +37,27 @@ class CycleResult:
     reasons: tuple[str, ...] = ()
 
 
+def _resolve_challenger(registry, base: StrategyDefinition, params: dict, now: datetime,
+                        hypothesis_id: str) -> StrategyDefinition:
+    """Identity by fingerprint. An identical registered definition is *re-tested* (same definition hash);
+    different parameters are a *different* definition and get their own version (lineage recorded via
+    ``derive``). A registered definition is never mutated."""
+    candidate = StrategyDefinition.create(base.strategy_id, base.version, base.kind, params, base.timeframe, now,
+                                          base.parent_hash, f"selected by walk-forward for {hypothesis_id}")
+    try:
+        registered = registry.get(candidate.key)
+    except KeyError:
+        return registry.register(candidate)
+    if registered.definition_hash == candidate.definition_hash:
+        return registered
+    for key in registry.keys():
+        d = registry.get(key)
+        if (d.strategy_id, d.kind, d.timeframe, d.code_hash, d.params) == \
+                (candidate.strategy_id, candidate.kind, candidate.timeframe, candidate.code_hash, candidate.params):
+            return d
+    return registry.derive(candidate.key, params, now, f"selected by walk-forward for {hypothesis_id}")
+
+
 def research_preconditions(system, full: Dataset, base: StrategyDefinition, *, hypothesis_id: str, min_candles: int,
                            require_market_data: bool) -> list[str]:
     """Everything that must hold before a research cycle may touch a dataset. Returns failures."""
@@ -127,11 +148,18 @@ def run_research_cycle(system, full: Dataset, boundary: datetime, *, hypothesis_
         return CycleResult(hypothesis_id, dev_verdict, None, None, None, None, mid)
 
     chosen = Counter(f.selected_params for f in wf.folds if f.selected_params).most_common(1)[0][0]
-    challenger = s.strategies.register(StrategyDefinition.create(
-        base.strategy_id, base.version, base.kind, dict(chosen), base.timeframe, now, base.parent_hash,
-        f"selected by walk-forward for {hypothesis_id}"))
-    if s.strategies.state(challenger.key) is Lifecycle.CANDIDATE:
-        s.strategies.transition(challenger.key, Lifecycle.CHALLENGER, f"survived development for {hypothesis_id}")
+    challenger = _resolve_challenger(s.strategies, base, dict(chosen), now, hypothesis_id)
+    state = s.strategies.state(challenger.key)
+    if state in (Lifecycle.CANDIDATE, Lifecycle.REJECTED):
+        why = "survived development" if state is Lifecycle.CANDIDATE else \
+            "re-admitted: survived development in a new retest; prior rejection remains in history"
+        s.strategies.transition(challenger.key, Lifecycle.CHALLENGER, f"{why} for {hypothesis_id}")
+    elif state is not Lifecycle.CHALLENGER:
+        # CHAMPION / RETIRED have no legal path through challenger evaluation in this workflow. Stop before
+        # the holdout is consumed; the development experiment above is already recorded.
+        reason = f"{challenger.key} is {state.value}; not eligible for challenger evaluation (holdout not used)"
+        journal.append("research_note", {"hypothesis_id": hypothesis_id, "note": reason})
+        return CycleResult(hypothesis_id, dev_verdict, challenger.key, None, None, None, None, "COMPLETED", (reason,))
 
     adv = challenge(challenger, dev, config, wf, log.hypotheses_tested, adversarial_policy)
     s.evidence.register("adversarial", adv.evidence_hash, now, "adversarial challenge",

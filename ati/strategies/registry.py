@@ -30,7 +30,11 @@ _ALLOWED = {
     Lifecycle.CHALLENGER: {Lifecycle.REJECTED},  # → CHAMPION only via apply_promotion
     Lifecycle.CHAMPION: {Lifecycle.RETIRED},     # retired only when replaced via apply_promotion
     Lifecycle.RETIRED: set(),
-    Lifecycle.REJECTED: set(),
+    # A rejection is evidence about one hypothesis, not a permanent ban on the definition: a *new*
+    # pre-registered hypothesis that re-tests the identical definition and survives development may
+    # re-admit it as a challenger — the same gate a new candidate passes. The earlier rejection stays
+    # in the append-only lifecycle history and in its immutable promotion record.
+    Lifecycle.REJECTED: {Lifecycle.CHALLENGER},
 }
 
 
