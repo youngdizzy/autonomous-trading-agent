@@ -40,6 +40,28 @@ class StrategyRegistry:
         self._state: dict[str, Lifecycle] = {}
         self._history: list[tuple[str, str, str, str]] = []
         self.journal = journal
+        if journal is not None:
+            self._replay(journal)
+
+    def _replay(self, journal: Journal) -> None:
+        """Rebuild from the hash-chained journal. A definition whose logic source has changed since it
+        was recorded fails to load (code_hash mismatch) rather than silently meaning something new."""
+        from ati.ledger.journal import decode
+        from ati.market.models import Timeframe
+
+        for entry in journal.entries():
+            p = decode(entry.payload)
+            if entry.type == "strategy_registered":
+                d = p["definition"]
+                definition = StrategyDefinition(d["strategy_id"], d["version"], d["kind"],
+                                                tuple((k, v) for k, v in d["params"]), Timeframe(d["timeframe"]),
+                                                d["created_at"], d["parent_hash"], d["description"], d["code_hash"])
+                if definition.definition_hash != p["definition_hash"]:
+                    raise StrategyImmutableError(f"{definition.key}: journaled definition hash mismatch")
+                self._defs[definition.key] = definition
+            elif entry.type == "strategy_lifecycle":
+                self._state[p["key"]] = Lifecycle(p["to"])
+                self._history.append((p["key"], p["from"], p["to"], p["reason"]))
 
     def _log(self, key: str, old: str, new: str, why: str) -> None:
         self._history.append((key, old, new, why))

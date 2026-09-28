@@ -11,13 +11,18 @@ were priced from, so paper results on MOCK data can never be presented as anythi
 
 from __future__ import annotations
 
+import json
+import os
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 from decimal import Decimal
+from pathlib import Path
 from typing import Callable
 
 from ati.config import OperatingMode
-from ati.core.errors import BrokerRejected, BrokerTimeout, BrokerUnavailable
+from ati.core.canonical import canonical_json
+from ati.core.errors import BrokerRejected, BrokerTimeout, BrokerUnavailable, ModeMismatch
+from ati.ledger.journal import decode
 from ati.core.time import Clock
 from ati.core.types import Side
 from ati.ledger.accounting import Fill
@@ -39,7 +44,8 @@ class PaperBroker:
     mode = OperatingMode.PAPER
 
     def __init__(self, quotes: Callable[[str], Quote], costs: CostModel, initial_cash: Decimal, data_status: DataStatus,
-                 clock: Clock, latency: timedelta = timedelta(milliseconds=500), max_quote_age: timedelta = timedelta(hours=2)):
+                 clock: Clock, latency: timedelta = timedelta(milliseconds=500), max_quote_age: timedelta = timedelta(hours=2),
+                 state_path: Path | str | None = None):
         self.quotes = quotes
         self.costs = costs
         self.cash = initial_cash
@@ -51,6 +57,31 @@ class PaperBroker:
         self.orders: dict[str, BrokerOrderReport] = {}
         self.faults: set[str] = set()
         self.submissions = 0  # number of times an order was actually executed at the venue
+        self.state_path = Path(state_path) if state_path else None
+        if self.state_path and self.state_path.exists():
+            self._load()
+
+    # --- venue persistence (the simulated venue outlives the trading process, like a real one) ------
+    def _save(self) -> None:
+        if not self.state_path:
+            return
+        doc = {"data_status": self.data_status, "cash": self.cash, "positions": self.positions,
+               "submissions": self.submissions, "orders": {k: v for k, v in self.orders.items()}}
+        tmp = self.state_path.with_suffix(".tmp")
+        tmp.write_text(canonical_json(doc))
+        os.replace(tmp, self.state_path)
+
+    def _load(self) -> None:
+        doc = decode(json.loads(self.state_path.read_text()))
+        if doc["data_status"] != self.data_status.value:
+            raise ModeMismatch("paper venue state was created for a different data status")
+        self.cash = doc["cash"]
+        self.positions = dict(doc["positions"])
+        self.submissions = doc["submissions"]
+        for coid, r in doc["orders"].items():
+            fills = tuple(Fill(f["fill_id"], f["client_order_id"], f["symbol"], Side(f["side"]), f["qty"], f["price"],
+                               f["fee"], f["at"], OperatingMode(f["mode"]), DataStatus(f["price_status"])) for f in r["fills"])
+            self.orders[coid] = BrokerOrderReport(coid, OrderStatus(r["status"]), r["filled_qty"], fills, r["message"])
 
     def _check_up(self) -> None:
         if "unavailable" in self.faults:
@@ -64,6 +95,7 @@ class PaperBroker:
             return self.orders[client_order_id]  # venue-side idempotency
         report = self._execute(client_order_id, symbol, side, qty)
         self.orders[client_order_id] = report
+        self._save()
         if "timeout_after_execute" in self.faults:
             raise BrokerTimeout("response lost (injected, executed)")
         if "false_reject_after_execute" in self.faults:
@@ -111,3 +143,4 @@ class PaperBroker:
     def external_cash_change(self, delta: Decimal) -> None:
         """Simulate an unexpected account change (deposit/withdrawal/venue adjustment)."""
         self.cash += delta
+        self._save()
