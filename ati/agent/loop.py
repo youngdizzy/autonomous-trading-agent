@@ -138,7 +138,7 @@ class AutonomousLoop:
                     raise DataIntegrityError("EMPTY", f"no closed candles for {symbol}")
                 if closed[0].status is not s.data_status:
                     raise DataIntegrityError("STATUS_MIX", f"provider returned {closed[0].status.value}, system is {s.data_status.value}")
-                s.store.ingest(closed)
+                s.archive.ingest(s.store, closed)
                 series = s.store.series(s.provider.name, symbol, s.timeframe)[-self.history_bars:]
                 check_freshness(series[-1], now, STALE_AFTER)
                 datasets[symbol] = Dataset.build(series, data_version="live-window", realization="observed")

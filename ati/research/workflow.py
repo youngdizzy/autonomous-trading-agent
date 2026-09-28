@@ -27,22 +27,70 @@ from ati.validation.promotion import PromotionPolicy, PromotionRecord, decide_pr
 @dataclass(frozen=True)
 class CycleResult:
     hypothesis_id: str
-    dev_verdict: Verdict
+    dev_verdict: Verdict | None
     challenger_key: str | None
     adversarial_blocking: bool | None
     holdout_verdict: Verdict | None
     promotion: PromotionRecord | None
-    memory_entry_id: str
+    memory_entry_id: str | None
+    status: str = "COMPLETED"          # COMPLETED | NOT_RUN
+    reasons: tuple[str, ...] = ()
+
+
+def research_preconditions(system, full: Dataset, base: StrategyDefinition, *, hypothesis_id: str, min_candles: int,
+                           require_market_data: bool) -> list[str]:
+    """Everything that must hold before a research cycle may touch a dataset. Returns failures."""
+    s = system
+    failures: list[str] = []
+    ident = full.identity
+    try:
+        full.verify()
+    except Exception as exc:  # any integrity doubt → not run
+        failures.append(f"dataset integrity: {exc}")
+    if require_market_data:
+        if ident.status not in MARKET_EVIDENCE_STATUSES:
+            failures.append(f"{ident.status.value} data where market data is required")
+        else:
+            try:
+                s.archive.verify_market_provenance(full)
+            except Exception as exc:
+                failures.append(f"provenance: {exc}")
+    if ident.status is not s.data_status:
+        failures.append(f"dataset is {ident.status.value}; this system is bound to {s.data_status.value}")
+    if ident.symbol not in s.universe:
+        failures.append(f"symbol {ident.symbol} not in universe")
+    if ident.timeframe is not base.timeframe:
+        failures.append(f"timeframe {ident.timeframe.value} != strategy timeframe {base.timeframe.value}")
+    if ident.partition.value != "FULL":
+        failures.append(f"partition {ident.partition.value}; a research cycle starts from a FULL dataset")
+    if not all(c.is_closed for c in full.candles):
+        failures.append("forming candles present")
+    if ident.n_candles < min_candles:
+        failures.append(f"INSUFFICIENT DATA: {ident.n_candles} candles < {min_candles} required by the protocol")
+    try:
+        full.require_not_holdout("research cycle")
+    except Exception as exc:
+        failures.append(str(exc))
+    if any(e.payload.get("hypothesis_id") == hypothesis_id for e in s.research_journal.entries("experiment")):
+        failures.append(f"{hypothesis_id} was already tested; a hypothesis is run exactly once")
+    return failures
 
 
 def run_research_cycle(system, full: Dataset, boundary: datetime, *, hypothesis_id: str, statement: str,
                        base: StrategyDefinition, grid: list[dict], criteria: tuple[Criterion, ...],
                        train_bars: int, test_bars: int, config: BacktestConfig = BacktestConfig(),
                        adversarial_policy: AdversarialPolicy = AdversarialPolicy(),
-                       promotion_policy: PromotionPolicy = PromotionPolicy()) -> CycleResult:
+                       promotion_policy: PromotionPolicy = PromotionPolicy(), min_candles: int = 0) -> CycleResult:
     s = system
     now = s.clock.now()
     journal = s.research_journal
+    require_market = not (adversarial_policy.allow_non_market_data and promotion_policy.allow_mock_evidence)
+    failures = research_preconditions(s, full, base, hypothesis_id=hypothesis_id, min_candles=min_candles,
+                                      require_market_data=require_market)
+    if failures:
+        journal.append("research_not_run", {"hypothesis_id": hypothesis_id, "dataset_id": full.dataset_id,
+                                            "reasons": failures})
+        return CycleResult(hypothesis_id, None, None, None, None, None, None, "NOT_RUN", tuple(failures))
     log = ResearchLog(journal)
     mock = full.identity.status not in MARKET_EVIDENCE_STATUSES
     tag = f"[{full.identity.status.value}] " if mock else ""

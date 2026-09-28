@@ -2,6 +2,8 @@
 
     python -m ati demo   --state-dir DIR   end-to-end research + paper loop on MOCK data, then status
     python -m ati verify --state-dir DIR   verify every journal's hash chain
+    python -m ati ingest-kraken --state-dir DIR   read-only Kraken OHLC fetch → REAL payload archive
+    python -m ati research-real --state-dir DIR   the pre-declared REAL research protocol, run once
 
 Everything the demo produces is MOCK: generated prices, scripted reasoning. It exercises the
 mechanics; it is not evidence about any market.
@@ -104,6 +106,69 @@ def demo(state_dir: Path, ticks: int) -> int:
     return 0
 
 
+def _real_system(state_dir: Path):
+    """PAPER system bound to REAL data from Kraken over the real network transport. Read-only market
+    data; LIVE_TRADING stays False; reasoning via the Claude-native file exchange."""
+    from ati.agent.reasoning import FileExchangeClient
+    from ati.core.time import SystemClock
+    from ati.market.kraken import KrakenPublicOHLC
+    from ati.market.provider import UrllibTransport
+
+    clock = SystemClock()
+    provider = KrakenPublicOHLC(UrllibTransport(), clock)
+    # The category comes from the transport (the network transport declares REAL); it is not asserted here.
+    return build_paper_system(state_dir, clock, provider, FileExchangeClient(state_dir / "exchange"),
+                              data_status=provider.data_status)
+
+
+def ingest_kraken(state_dir: Path, symbol: str) -> int:
+    from ati.core.errors import ProviderError
+
+    s = _real_system(state_dir)
+    now = s.clock.now()
+    before = len(s.store.series("kraken", symbol, Timeframe.H1))
+    try:
+        candles = s.provider.fetch_candles(symbol, Timeframe.H1, now - timedelta(hours=720), now)
+    except ProviderError as exc:
+        print(f"LIVE_CONNECTIVITY = BLOCKED\n  endpoint : https://api.kraken.com/0/public/OHLC\n"
+              f"  error    : {type(exc).__name__}: {exc}\n  cause    : {exc.__cause__!r}\n  nothing was ingested")
+        return 3
+    added = s.archive.ingest(s.store, candles)
+    series = s.store.series("kraken", symbol, Timeframe.H1)
+    print(f"LIVE_CONNECTIVITY = VERIFIED\n  payloads archived : {len(s.archive)}\n  candles received  : {len(candles)} "
+          f"(closed {sum(c.is_closed for c in candles)})\n  new closed candles: {added}\n"
+          f"  series            : {before} -> {len(series)} candles, {series[0].open_time} .. {series[-1].close_time}")
+    return 0
+
+
+def research_real(state_dir: Path) -> int:
+    from ati.research import protocol as P
+
+    s = _real_system(state_dir)
+    series = s.store.series("kraken", P.SYMBOL, P.TIMEFRAME)
+    print(f"== REAL RESEARCH ({P.PROTOCOL_ID}) ==")
+    if not series:
+        s.research_journal.append("research_not_run", {"hypothesis_id": P.HYPOTHESIS_ID, "reasons": ["no archived REAL data"]})
+        print("REAL RESEARCH RUN = NOT_RUN\n  - no archived REAL data (run `ati ingest-kraken`; currently BLOCKED by egress policy)")
+        return 4
+    full = Dataset.build(series, data_version="kraken-ohlc-archive", realization="observed")
+    print(f"  dataset  : {full.dataset_id} ({len(full)} candles {full.identity.start} .. {full.identity.end})")
+    boundary = full.candles[int(len(full) * (1 - P.HOLDOUT_FRACTION))].open_time
+    result = run_research_cycle(s, full, boundary, hypothesis_id=P.HYPOTHESIS_ID, statement=P.STATEMENT,
+                                base=P.base_definition(s.clock.now()), grid=P.GRID, criteria=P.CRITERIA,
+                                train_bars=P.TRAIN_BARS, test_bars=P.TEST_BARS, min_candles=P.MIN_CANDLES)
+    if result.status == "NOT_RUN":
+        print("REAL RESEARCH RUN = NOT_RUN")
+        for r in result.reasons:
+            print(f"  - {r}")
+        return 4
+    print(f"  development verdict : {result.dev_verdict.value}\n  challenger          : {result.challenger_key}\n"
+          f"  adversarial blocking: {result.adversarial_blocking}\n"
+          f"  holdout verdict     : {result.holdout_verdict and result.holdout_verdict.value}\n"
+          f"  promotion           : {result.promotion and ('APPROVED' if result.promotion.approved else 'DENIED')}")
+    return 0
+
+
 def verify(state_dir: Path) -> int:
     ok = True
     for path in sorted(state_dir.glob("*.jsonl")):
@@ -125,7 +190,16 @@ def main(argv: list[str] | None = None) -> int:
     d.add_argument("--ticks", type=int, default=72)
     v = sub.add_parser("verify")
     v.add_argument("--state-dir", type=Path, required=True)
+    k = sub.add_parser("ingest-kraken", help="read-only Kraken OHLC fetch into the REAL payload archive")
+    k.add_argument("--state-dir", type=Path, required=True)
+    k.add_argument("--symbol", default="BTC/USD")
+    r = sub.add_parser("research-real", help="run the pre-declared REAL research protocol once")
+    r.add_argument("--state-dir", type=Path, required=True)
     args = parser.parse_args(argv)
+    if args.cmd == "ingest-kraken":
+        return ingest_kraken(args.state_dir, args.symbol)
+    if args.cmd == "research-real":
+        return research_real(args.state_dir)
     if args.cmd == "demo":
         if args.state_dir.exists() and any(args.state_dir.iterdir()):
             print("state dir not empty; use a fresh directory for the demo", file=sys.stderr)

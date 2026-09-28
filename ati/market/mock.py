@@ -20,6 +20,7 @@ class MockProvider:
     """Deterministic regime-switching random walk. Same (seed, params) → same candles."""
 
     name = "mock"
+    data_status = DataStatus.MOCK
 
     def __init__(
         self,

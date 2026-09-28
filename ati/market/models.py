@@ -103,6 +103,15 @@ class Candle:
             raise DataIntegrityError("TYPE", "is_closed must be bool")
         if not self.provider or not self.symbol:
             raise DataIntegrityError("IDENTITY", "provider and symbol are required")
+        if self.status in MARKET_EVIDENCE_STATUSES:
+            # First gate on market-evidence labels: they must trace to a provider payload. The binding
+            # gate is ati.market.archive.verify_market_provenance, which re-derives candles from the
+            # journaled raw payload.
+            raw = self.provenance.raw_sha256 if isinstance(self.provenance, Provenance) else None
+            if not (isinstance(raw, str) and len(raw) == 64 and all(ch in "0123456789abcdef" for ch in raw)):
+                raise DataIntegrityError("PROVENANCE", f"{self.status.value} candle without a provider payload hash")
+            if self.provenance.source != self.provider:
+                raise DataIntegrityError("PROVENANCE", "provenance source does not match provider")
         try:
             object.__setattr__(self, "open_time", ensure_utc(self.open_time, "open_time"))
             object.__setattr__(self, "received_at", ensure_utc(self.received_at, "received_at"))

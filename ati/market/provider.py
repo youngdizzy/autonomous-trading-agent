@@ -10,7 +10,7 @@ from datetime import datetime
 from typing import Any, Protocol
 
 from ati.core.errors import MalformedResponse, ProviderUnavailable, RateLimited
-from ati.market.models import Candle, Timeframe
+from ati.market.models import Candle, DataStatus, Timeframe
 
 
 class MarketDataProvider(Protocol):
@@ -24,15 +24,23 @@ class MarketDataProvider(Protocol):
 
 
 class HttpTransport(Protocol):
+    #: The data category of bytes this transport delivers. Provenance is owned here, by the
+    #: ingestion layer: an adapter labels candles with its transport's status, never with a
+    #: constant. Only a transport that actually performs network I/O to the provider may say REAL.
+    data_status: DataStatus
+
     def get_json(self, url: str, params: dict[str, str], timeout_s: float) -> tuple[Any, bytes]:
         """Return (parsed JSON, raw bytes)."""
         ...
 
 
 class UrllibTransport:
-    """Real HTTPS transport (stdlib). Honors HTTPS_PROXY via urllib's environment handling.
-    In the Foundation 1.0 environment all market hosts are denied by egress policy, so this
-    transport is IMPLEMENTED — EXTERNAL VERIFICATION BLOCKED."""
+    """Real HTTPS transport (stdlib). Honors HTTPS_PROXY via urllib's environment handling and
+    the system trust store; TLS verification is never disabled.
+    IMPLEMENTED — EXTERNAL VERIFICATION BLOCKED (api.kraken.com denied by the environment's egress
+    policy as of 2026-09-28)."""
+
+    data_status = DataStatus.REAL  # the only transport in the codebase allowed to declare REAL
 
     def get_json(self, url: str, params: dict[str, str], timeout_s: float) -> tuple[Any, bytes]:
         full = f"{url}?{urllib.parse.urlencode(params)}" if params else url

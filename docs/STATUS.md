@@ -13,7 +13,12 @@ Vocabulary is exact. Nothing below is upgraded from one state to another.
 |---|---|
 | Market data provider abstraction, typed candles, integrity checks | IMPLEMENTED |
 | MOCK market data provider | IMPLEMENTED (all output labelled MOCK) |
-| Kraken public OHLC adapter | IMPLEMENTED — EXTERNAL VERIFICATION BLOCKED (api.kraken.com denied by egress policy) |
+| Kraken public OHLC adapter (pair/order/`last`/interval checks, transport-owned status) | IMPLEMENTED — EXTERNAL VERIFICATION BLOCKED (api.kraken.com denied by egress policy, re-confirmed 2026-09-28) |
+| Raw provider payload archive (write-ahead, replay, provenance re-derivation) | IMPLEMENTED (verified with MOCK payloads only) |
+| REAL provenance gate (REAL only from the network transport; files/fixtures/Claude cannot mint REAL) | IMPLEMENTED |
+| Research preconditions → NOT_RUN; one run per hypothesis | IMPLEMENTED |
+| Pre-declared REAL research protocol (`REAL-PROTOCOL-001`) | IMPLEMENTED; REAL RESEARCH RUN = NOT_RUN (no REAL data) |
+| `ati ingest-kraken` / `ati research-real` | IMPLEMENTED — EXTERNAL VERIFICATION BLOCKED |
 | stdlib HTTPS transport | IMPLEMENTED — EXTERNAL VERIFICATION BLOCKED |
 | Deep historical backfill (Kraken Trades endpoint or other) | NOT IMPLEMENTED |
 | Fail-closed historical store | IMPLEMENTED |
@@ -31,7 +36,7 @@ Vocabulary is exact. Nothing below is upgraded from one state to another.
 | Deterministic risk engine + kill switch | IMPLEMENTED |
 | Idempotent execution, reconciliation, recovery | IMPLEMENTED (against paper venue) |
 | Paper venue | IMPLEMENTED (prices from whatever data feeds it; currently MOCK only) |
-| Paper trading on REAL market data | BLOCKED — ENVIRONMENT CAPABILITY (no market data reachable) |
+| Paper trading on REAL market data | BLOCKED — ENVIRONMENT CAPABILITY (no market data reachable); the same adapter→archive→loop→paper path is verified with a Kraken-shaped MOCK feed |
 | Live broker adapter | NOT IMPLEMENTED; LIVE_TRADING = false |
 | Structured memory + evidence registry | IMPLEMENTED |
 | Claude output schema, roles, MOCK and file-exchange reasoning clients | IMPLEMENTED |

@@ -88,7 +88,7 @@ class TestSeriesValidation:
         validate_series(s, symbol="BTC/USD", timeframe=Timeframe.H1, require_closed=False)
 
     def test_status_mix_never_silently_combined(self):
-        s = self.series() + [make_candle(5, status=DataStatus.REAL, provider="mock")]
+        s = self.series() + [make_candle(5, status=DataStatus.SYNTHETIC, provider="mock")]
         assert codes(lambda: validate_series(s, symbol="BTC/USD", timeframe=Timeframe.H1)) == "STATUS_MIX"
 
     def test_mixed_provider(self):
@@ -143,7 +143,7 @@ class TestStore:
         store = CandleStore()
         store.ingest([make_candle(0)])
         with pytest.raises(DataIntegrityError):
-            store.ingest([make_candle(1, status=DataStatus.REAL)])
+            store.ingest([make_candle(1, status=DataStatus.SYNTHETIC)])
 
 
 class TestMockProvider:

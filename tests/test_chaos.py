@@ -25,6 +25,7 @@ class FlakyProvider:
 
     def __init__(self, inner):
         self.inner, self.name, self.mode = inner, inner.name, None
+        self.data_status = inner.data_status
 
     def fetch_candles(self, symbol, tf, start, end):
         if self.mode == "down":

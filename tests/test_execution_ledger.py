@@ -146,7 +146,7 @@ class TestAccounting:
         with pytest.raises(ModeMismatch):
             a.apply_fill(self.fill("f1", Side.BUY, "1", "100", mode=OperatingMode.LIVE))
         with pytest.raises(ModeMismatch):
-            a.apply_fill(self.fill("f2", Side.BUY, "1", "100", status=DataStatus.REAL))
+            a.apply_fill(self.fill("f2", Side.BUY, "1", "100", status=DataStatus.SYNTHETIC))
 
     def test_invalid_fill_values(self):
         with pytest.raises(ValueError):

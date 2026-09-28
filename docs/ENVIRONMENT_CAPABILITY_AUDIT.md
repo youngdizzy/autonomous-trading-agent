@@ -132,3 +132,22 @@ truncation is detected on load (fail closed).
 | Scheduling | PARTIALLY_AVAILABLE (hourly Routines) |
 
 No blocked capability required weakening a security control or changing the architecture.
+
+## Re-audit — Real Market Evidence Activation 1.0 (2026-09-28)
+
+| Probe | Observed |
+|---|---|
+| DNS `api.kraken.com` | resolves (104.17.185–189.205, Cloudflare) |
+| `GET https://api.kraken.com/0/public/Time` (curl, env proxy, default TLS) | `CONNECT tunnel failed, response 403` |
+| `GET https://api.kraken.com/0/public/OHLC?pair=XBTUSD&interval=60` (curl) | `CONNECT tunnel failed, response 403` |
+| Same OHLC request through the repository (`KrakenPublicOHLC` + `UrllibTransport`) | `ProviderUnavailable: <urlopen error Tunnel connection failed: 403 Forbidden>` — repository code reached the gateway and failed closed; nothing ingested |
+| Agent proxy status log | `connect_rejected` for `api.kraken.com:443`: "gateway answered 403 to CONNECT (policy denial or upstream failure)" |
+
+```
+LIVE_CONNECTIVITY = BLOCKED — ENVIRONMENT CAPABILITY (egress policy)
+```
+
+The failure is environmental: DNS works, TLS was never reached, and the proxy rejects the tunnel
+before any Kraken server is contacted. Minimum change: the environment owner adds `api.kraken.com`
+to the allowed domains (session title bar → environment menu → Edit → Network access). No code
+change, TLS change, or proxy workaround is required or was attempted.

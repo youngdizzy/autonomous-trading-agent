@@ -11,13 +11,14 @@ from pathlib import Path
 from ati.agent.pipeline import DecisionPipeline
 from ati.agent.reasoning import ReasoningClient
 from ati.config import OperatingMode, assert_mode_permitted
-from ati.core.errors import DataIntegrityError
+from ati.core.errors import DataIntegrityError, ModeMismatch
 from ati.core.time import Clock
 from ati.decision.records import DecisionLog
 from ati.execution.engine import ExecutionEngine
 from ati.execution.paper import PaperBroker, Quote
 from ati.data.dataset import DatasetIdentity, Partition, seal_holdout_range
 from ati.ledger.journal import Journal, decode
+from ati.market.archive import PayloadArchive
 from ati.market.models import DataStatus, Timeframe
 from ati.market.provider import MarketDataProvider
 from ati.market.store import CandleStore
@@ -57,6 +58,7 @@ class System:
     research_journal: Journal
     reasoning: ReasoningClient
     pipeline: DecisionPipeline
+    archive: PayloadArchive
 
 
 def build_paper_system(state_dir: Path | str, clock: Clock, provider: MarketDataProvider, reasoning: ReasoningClient, *,
@@ -71,6 +73,10 @@ def build_paper_system(state_dir: Path | str, clock: Clock, provider: MarketData
     guard = guard or SecretGuard()
     universe = universe or default_universe()
     attrs = {"mode": mode.value, "data_status": data_status.value}
+    declared = getattr(provider, "data_status", DataStatus.UNKNOWN)
+    if declared is not data_status:
+        raise ModeMismatch(f"provider {provider.name} delivers {getattr(declared, 'value', declared)} data; "
+                           f"system is {data_status.value}")
     store = CandleStore()
 
     def quotes(symbol: str) -> Quote:
@@ -86,7 +92,12 @@ def build_paper_system(state_dir: Path | str, clock: Clock, provider: MarketData
     broker = PaperBroker(quotes, costs, initial_cash, data_status, clock, state_path=state / "paper_venue.json")
     execution = ExecutionEngine(broker, state / "execution.jsonl", authority, clock, mode=mode, data_status=data_status,
                                 initial_cash=initial_cash, guard=guard)
-    evidence = EvidenceRegistry(Journal(state / "evidence.jsonl", kind="evidence", attrs=attrs, clock=clock, guard=guard))
+    evidence_journal = Journal(state / "evidence.jsonl", kind="evidence", attrs=attrs, clock=clock, guard=guard)
+    evidence = EvidenceRegistry(evidence_journal)
+    archive = PayloadArchive(evidence_journal)
+    if hasattr(provider, "archive"):
+        provider.archive = archive  # raw payloads journaled before parsing (write-ahead provenance)
+    archive.replay(store)  # accumulated history is re-derived from archived provider payloads
     memory = MemoryStore(Journal(state / "memory.jsonl", kind="memory", attrs=attrs, clock=clock, guard=guard), evidence)
     decisions = DecisionLog(Journal(state / "decisions.jsonl", kind="decisions", attrs=attrs, clock=clock, guard=guard), evidence)
     research_journal = Journal(state / "research.jsonl", kind="research", attrs=attrs, clock=clock, guard=guard)
@@ -99,7 +110,7 @@ def build_paper_system(state_dir: Path | str, clock: Clock, provider: MarketData
                                 evidence=evidence, memory=memory, reasoning=reasoning, guard=guard)
     return System(state, clock, mode, data_status, timeframe, tuple(symbols), universe, provider, store, costs, limits,
                   guard, kill, authority, risk, broker, execution, evidence, memory, decisions, strategies,
-                  research_journal, reasoning, pipeline)
+                  research_journal, reasoning, pipeline, archive)
 
 
 DEFAULT_HISTORY_BARS = 300

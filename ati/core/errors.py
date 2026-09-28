@@ -20,6 +20,10 @@ class HistoricalConflictError(AtiError):
     """Previously recorded history disagrees with newly received history. Fail closed."""
 
 
+class ProvenanceError(AtiError):
+    """Data claims a category (e.g. REAL) that its recorded provider provenance does not support."""
+
+
 class DatasetIntegrityError(AtiError):
     """A dataset's content no longer matches its recorded identity."""
 

@@ -21,9 +21,9 @@ from pathlib import Path
 from typing import Sequence
 
 from ati.core.canonical import canonical_json, sha256_hex
-from ati.core.errors import DatasetIntegrityError, HoldoutViolation
+from ati.core.errors import DatasetIntegrityError, HistoricalConflictError, HoldoutViolation, ProvenanceError
 from ati.core.time import ensure_utc, parse_utc, to_iso
-from ati.market.models import Candle, DataStatus, Provenance, Timeframe
+from ati.market.models import MARKET_EVIDENCE_STATUSES, Candle, DataStatus, Provenance, Timeframe
 from ati.market.validation import count_gaps, validate_series
 
 
@@ -181,7 +181,7 @@ class Dataset:
         Path(path).write_text(json.dumps(doc, sort_keys=True))
 
     @classmethod
-    def load(cls, path: Path, expected_id: str | None = None) -> "Dataset":
+    def load(cls, path: Path, expected_id: str | None = None, provenance_verifier=None) -> "Dataset":
         doc = json.loads(Path(path).read_text())
         ident = doc["identity"]
         tf = Timeframe(ident["timeframe"])
@@ -208,7 +208,24 @@ class Dataset:
             raise DatasetIntegrityError(f"{path}: stored content hash does not match content (historical mutation)")
         if ds.dataset_id != doc["dataset_id"] or (expected_id and ds.dataset_id != expected_id):
             raise DatasetIntegrityError(f"{path}: dataset id mismatch")
+        if status in MARKET_EVIDENCE_STATUSES:
+            # A file's own claim of REAL is never sufficient: the category must be re-derived from
+            # archived provider payloads (ati.market.archive.PayloadArchive.verify_market_provenance).
+            if provenance_verifier is None:
+                raise ProvenanceError(f"{path}: {status.value} dataset cannot be loaded without provenance verification")
+            provenance_verifier(ds)
         return ds
+
+    def verify_extension_of(self, older: "Dataset") -> None:
+        """Legitimate growth vs historical mutation. Passes only if this dataset is the same series
+        and contains every candle of ``older`` with identical content (new bars may be appended)."""
+        a, b = older.identity, self.identity
+        if (a.provider, a.symbol, a.timeframe, a.status) != (b.provider, b.symbol, b.timeframe, b.status):
+            raise HistoricalConflictError("not the same series")
+        mine = {c.open_time: c.content_key() for c in self._candles}
+        for candle in older.candles:
+            if mine.get(candle.open_time) != candle.content_key():
+                raise HistoricalConflictError(f"historical candle {candle.open_time} is missing or changed")
 
 
 # --- sealed holdout periods ---------------------------------------------------------------------
