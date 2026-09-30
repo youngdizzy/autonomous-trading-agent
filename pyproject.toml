@@ -1,0 +1,13 @@
+[project]
+name = "ati"
+version = "0.1.0"
+description = "Autonomous Trading Intelligence — Foundation 1.0 (research, deterministic risk, paper execution). LIVE trading disabled."
+requires-python = ">=3.11"
+dependencies = []  # runtime is Python standard library only
+
+[project.optional-dependencies]
+test = ["pytest>=8"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+addopts = "-q --strict-markers"

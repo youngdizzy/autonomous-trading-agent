@@ -1,0 +1,13 @@
+{
+  "_MOCK_NOTICE": "MOCK FIXTURE. Hand-constructed to follow Kraken's documented public OHLC response shape. NOT a recorded Kraken response; api.kraken.com is BLOCKED by this environment's egress policy. Values are invented.",
+  "error": [],
+  "result": {
+    "XXBTZUSD": [
+      [1704067200, "42000.0", "42150.5", "41950.0", "42100.1", "42060.3", "12.50000000", 310],
+      [1704070800, "42100.1", "42300.0", "42080.0", "42250.0", "42190.0", "9.75000000", 250],
+      [1704074400, "42250.0", "42260.0", "42010.0", "42050.5", "42120.0", "15.10000000", 402],
+      [1704078000, "42050.5", "42090.0", "42000.0", "42070.0", "42050.0", "1.20000000", 40]
+    ],
+    "last": 1704074400
+  }
+}

@@ -1,0 +1,29 @@
+{
+  "_comment": "Security-scan signatures for untrusted external source (data, not code). category UNSAFE stops a candidate; EXECUTION marks execution/network/filesystem code. Matched as regular expressions.",
+  "patterns": {
+    "dynamic_code": {
+      "category": "UNSAFE",
+      "regex": "\\beval\\s*\\(|new\\s+Function\\s*\\(|\\bexec\\s*\\(|\\bcompile\\s*\\(|__import__|importlib"
+    },
+    "shell": {
+      "category": "UNSAFE",
+      "regex": "child_process|subprocess|os\\.system|os\\.popen|\\bspawn\\s*\\("
+    },
+    "credentials": {
+      "category": "UNSAFE",
+      "regex": "(?i)private[_ ]?key|secret[_ ]?key|api[_ ]?key|passphrase|mnemonic"
+    },
+    "order_calls": {
+      "category": "EXECUTION",
+      "regex": "exchanges?(\\[\\d+\\])?\\.(Buy|Sell|CreateOrder|CancelOrder)\\s*\\(|\\b(BK|SK|BP|SP|BPK|SPK)\\b"
+    },
+    "network": {
+      "category": "EXECUTION",
+      "regex": "HttpQuery|\\bfetch\\s*\\(|XMLHttpRequest|WebSocket|\\bDial\\s*\\(|\\brequests\\.|urllib|http\\.client|\\bsocket\\."
+    },
+    "filesystem": {
+      "category": "EXECUTION",
+      "regex": "\\bfs\\.|writeFile|open\\s*\\([^)]*['\\\"][wa]['\\\"]|\\b_G\\s*\\("
+    }
+  }
+}
