@@ -145,3 +145,13 @@ class StateLocked(AtiError):
 class ExternalSourceError(AtiError):
     """An external strategy source cannot be identified, read or reconciled with its recorded identity
     (e.g. the same repository/commit/path now yields different bytes). Nothing is imported. Fail closed."""
+
+
+class SubmissionRefused(AtiError):
+    """A risk-approved order was refused by a pre-submission execution gate (mode, kill switch, account freshness,
+    open order, operator approval, autonomous limit, broker health, live flag). Nothing was sent to the venue; the
+    refusal is journaled with the rule that refused it."""
+
+    def __init__(self, rule: str, message: str):
+        super().__init__(f"[{rule}] {message}")
+        self.rule = rule

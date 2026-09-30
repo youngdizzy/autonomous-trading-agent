@@ -238,9 +238,12 @@ def test_unexpected_balance_change_halts_until_explained(tmp_path):
 def test_network_loss_during_execution(tmp_path):
     rig = Rig(tmp_path)
     rig.exe.reconcile()
-    rig.broker.faults.add("unavailable")
+    # the venue passes its health check, then the connection drops during submission (a venue that is already
+    # down fails the pre-submission health gate and nothing is sent — see test_broker_execution_boundary.py)
+    rig.broker.faults.add("disconnect_on_submit")
     order = rig.exe.submit(rig.verdict())
     assert order.status is OrderStatus.UNKNOWN and rig.exe.halted
+    rig.broker.faults.add("unavailable")                    # and stays down
     assert rig.exe.reconcile().state is ReconState.UNKNOWN  # still cannot see the venue: stay stopped
     assert rig.exe.halted
     rig.broker.faults.clear()

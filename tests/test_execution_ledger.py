@@ -37,14 +37,14 @@ class Rig:
         self.volume = volume
         self.authority = ApprovalAuthority()
         self.broker = PaperBroker(self.quote, CostModel(), CASH, DataStatus.MOCK, self.clock)
-        self.risk = RiskEngine(RiskLimits(), default_universe(), KillSwitch(tmp_path / "kill.json", self.clock),
-                               self.authority, self.clock)
+        self.kill = KillSwitch(tmp_path / "kill.json", self.clock)
+        self.risk = RiskEngine(RiskLimits(), default_universe(), self.kill, self.authority, self.clock)
         self.exe = self.new_engine()
         self.n = 0
 
     def new_engine(self):
         return ExecutionEngine(self.broker, self.tmp / "exec.jsonl", self.authority, self.clock, mode=OperatingMode.PAPER,
-                               data_status=DataStatus.MOCK, initial_cash=CASH)
+                               data_status=DataStatus.MOCK, initial_cash=CASH, kill_switch=self.kill)
 
     def quote(self, symbol):
         return Quote(symbol, self.price, self.clock.now(), self.volume, DataStatus.MOCK)

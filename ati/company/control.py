@@ -40,6 +40,8 @@ from ati.company.learning import LearningLedger
 from ati.core.canonical import sha256_hex, sha256_text
 from ati.core.errors import AtiError, CompanyStateError, HoldoutViolation, SchemaViolation
 from ati.core.types import Side
+from ati.execution.broker import TERMINAL
+from ati.execution.policy import live_state
 from ati.data.dataset import Dataset, Partition, sealed_ranges
 from ati.decision.records import make_decision_id
 from ati.ledger.journal import Journal, decode
@@ -883,7 +885,15 @@ class CompanyControlPlane:
                            "max_risk_per_trade_fraction": str(s.limits.max_risk_per_trade_fraction),
                            "limits_hash": s.limits.limits_hash, "owner": "code; not changeable by any action",
                            "portfolio": {"cash": str(s.execution.account.cash), "positions": self._positions(marks),
-                                         "realized_pnl": str(s.execution.account.realized_pnl)}},
+                                         "realized_pnl": str(s.execution.account.realized_pnl)},
+                           # read-only execution facts; Claude cannot change the mode, the live state or any order
+                           "execution": {"mode": s.execution.policy.mode.value, "live": live_state(),
+                                         "halted": s.execution.halted,
+                                         "working_orders": [{"symbol": o.symbol, "side": o.side.value,
+                                                             "status": o.status.value}
+                                                            for o in s.execution.orders.values()
+                                                            if o.status not in TERMINAL],
+                                         "last_refusal_rule": (s.execution.last_refusal or {}).get("rule")}},
             "RECENT_OUTCOMES": [{"outcome_id": o.outcome_id, "source": o.source, "at": o.at, "data_category": o.data_category,
                                  "realized": o.realized, "deviation": o.deviation}
                                 for o in list(self.learning.outcomes.values())[-6:]],

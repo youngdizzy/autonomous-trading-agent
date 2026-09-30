@@ -23,7 +23,7 @@ from ati.agent.reasoning import ReasoningBudgetExceeded, ReasoningClient, Reason
 from ati.agent.roles import ADVERSARIAL, PRIMARY, Tier, build_prompt
 from ati.agent.schema import (NoTrade, ResearchRequest, TradeProposal, ValidationContext, parse_decision_output,
                               parse_review_output)
-from ati.core.errors import LookaheadError, SchemaViolation
+from ati.core.errors import LookaheadError, SchemaViolation, SubmissionRefused
 from ati.core.time import Clock, to_iso
 from ati.core.types import Side
 from ati.decision.records import DecisionLog, DecisionRecord, FinalDecision, make_decision_id
@@ -177,8 +177,7 @@ class DecisionPipeline:
         result = self._record(**base, final=final, proposal=out, stop=stop, review=review, verdict=verdict,
                               reason=reason, confidence=out.confidence, refs=out.evidence_refs)
         if result.decision is not None and result.decision.final_decision is FinalDecision.EXECUTE:
-            order = self.execution.submit(verdict)
-            return PipelineResult(Outcome.RECORDED, result.decision, verdict, order)
+            return PipelineResult(Outcome.RECORDED, result.decision, verdict, self._submit(verdict))
         return result
 
     # --- deterministic exit -----------------------------------------------------------------------
@@ -202,8 +201,17 @@ class DecisionPipeline:
             final_decision=FinalDecision.EXECUTE if verdict.approved else FinalDecision.REJECTED_BY_RISK,
             reason="risk approved exit" if verdict.approved else "; ".join(c.detail for c in verdict.failed)[:600])
         self.decisions.record(rec)
-        order = self.execution.submit(verdict) if verdict.approved else None
+        order = self._submit(verdict) if verdict.approved else None
         return PipelineResult(Outcome.RECORDED, rec, verdict, order)
+
+    def _submit(self, verdict: RiskVerdict) -> Order | None:
+        """Risk authorization is not execution: a pre-submission gate (mode, kill switch, account freshness, open
+        order, operator approval, autonomous limit, broker health) may still refuse. The refusal is journaled by the
+        execution engine with its rule; the decision record keeps the risk verdict. No order → None."""
+        try:
+            return self.execution.submit(verdict)
+        except SubmissionRefused:
+            return None
 
     # --- helpers ------------------------------------------------------------------------------------
     @staticmethod

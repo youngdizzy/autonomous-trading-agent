@@ -6,7 +6,9 @@ Fills use the latest quote from a market-data source, the same ``CostModel`` as 
 assumption stamped on each fill. Fills carry ``mode=PAPER`` and the data status of the quote they
 were priced from, so paper results on MOCK data can never be presented as anything else.
 
-``faults`` is a test-only fault-injection set used by the chaos suite.
+``faults`` is a test-only fault-injection set used by the chaos suite: ``unavailable`` (venue down, health check
+fails), ``disconnect_on_submit`` (connection drops during submission after a healthy check), ``timeout_before_execute``,
+``timeout_after_execute``, ``false_reject_after_execute``.
 """
 
 from __future__ import annotations
@@ -27,7 +29,7 @@ from ati.core.time import Clock
 from ati.core.types import Side
 from ati.ledger.accounting import Fill
 from ati.market.models import DataStatus
-from ati.execution.broker import BrokerAccount, BrokerOrderReport, OrderStatus
+from ati.execution.broker import BrokerAccount, BrokerHealth, BrokerOrderReport, OrderStatus
 from ati.research.costs import CostModel
 
 
@@ -87,8 +89,27 @@ class PaperBroker:
         if "unavailable" in self.faults:
             raise BrokerUnavailable("paper venue unavailable (injected)")
 
+    def health_check(self) -> BrokerHealth:
+        up = "unavailable" not in self.faults
+        return BrokerHealth(up, (("venue_reachable", up, "paper venue" if up else "unavailable (injected)"),
+                                 ("order_entry", up, "immediate-or-cancel market orders")))
+
+    def list_orders(self) -> tuple[BrokerOrderReport, ...]:
+        self._check_up()
+        return tuple(self.orders[k] for k in sorted(self.orders))
+
+    def cancel_order(self, client_order_id: str) -> BrokerOrderReport:
+        """Paper orders are immediate-or-cancel and therefore already final; a cancel returns the final report."""
+        self._check_up()
+        report = self.orders.get(client_order_id)
+        if report is None:
+            return BrokerOrderReport(client_order_id, OrderStatus.NOT_FOUND, Decimal(0), (), "no such order")
+        return report
+
     def submit_order(self, client_order_id: str, symbol: str, side: Side, qty: Decimal) -> BrokerOrderReport:
         self._check_up()
+        if "disconnect_on_submit" in self.faults:
+            raise BrokerUnavailable("connection dropped while submitting (injected, not executed)")
         if "timeout_before_execute" in self.faults:
             raise BrokerTimeout("no response (injected, not executed)")
         if client_order_id in self.orders:

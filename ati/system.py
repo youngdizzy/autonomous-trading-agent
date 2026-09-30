@@ -15,6 +15,7 @@ from ati.core.errors import DataIntegrityError, ModeMismatch
 from ati.core.time import Clock
 from ati.decision.records import DecisionLog
 from ati.execution.engine import ExecutionEngine
+from ati.execution.policy import ExecutionPolicy
 from ati.execution.paper import PaperBroker, Quote
 from ati.data.dataset import DatasetIdentity, Partition, seal_holdout_range
 from ati.ledger.journal import Journal, decode
@@ -65,7 +66,8 @@ def build_paper_system(state_dir: Path | str, clock: Clock, provider: MarketData
                        symbols: tuple[str, ...] = ("BTC/USD",), timeframe: Timeframe = Timeframe.H1,
                        data_status: DataStatus, initial_cash: Decimal = Decimal("100000"),
                        limits: RiskLimits = RiskLimits(), costs: CostModel = CostModel(),
-                       guard: SecretGuard | None = None, universe: Universe | None = None) -> System:
+                       guard: SecretGuard | None = None, universe: Universe | None = None,
+                       execution_policy: ExecutionPolicy = ExecutionPolicy()) -> System:
     mode = OperatingMode.PAPER
     assert_mode_permitted(mode)
     state = Path(state_dir)
@@ -91,7 +93,7 @@ def build_paper_system(state_dir: Path | str, clock: Clock, provider: MarketData
     risk = RiskEngine(limits, universe, kill, authority, clock)
     broker = PaperBroker(quotes, costs, initial_cash, data_status, clock, state_path=state / "paper_venue.json")
     execution = ExecutionEngine(broker, state / "execution.jsonl", authority, clock, mode=mode, data_status=data_status,
-                                initial_cash=initial_cash, guard=guard)
+                                initial_cash=initial_cash, kill_switch=kill, policy=execution_policy, guard=guard)
     evidence_journal = Journal(state / "evidence.jsonl", kind="evidence", attrs=attrs, clock=clock, guard=guard)
     evidence = EvidenceRegistry(evidence_journal)
     archive = PayloadArchive(evidence_journal)

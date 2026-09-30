@@ -51,6 +51,8 @@ Vocabulary is exact. Nothing below is upgraded from one state to another.
 | Paper venue | IMPLEMENTED (prices from whatever data feeds it; currently MOCK only) |
 | Paper trading on REAL market data | BLOCKED — ENVIRONMENT CAPABILITY (no market data reachable); the same adapter→archive→loop→paper path is verified with a Kraken-shaped MOCK feed |
 | Live broker adapter | NOT IMPLEMENTED; LIVE_TRADING = false |
+| Broker execution boundary (extended `Broker` contract: health check, order list, cancel; lifecycle ACKNOWLEDGED / PARTIALLY_FILLED / CANCEL_REQUESTED / EXPIRED; pre-submission gates; execution modes OBSERVE · PAPER · ASSISTED · AUTONOMOUS_LIMITED; reconciliation of unexpected orders/fills and fill quantity/price) | IMPLEMENTED — verified against the deterministic `MockBrokerAdapter` and the paper venue only |
+| Real broker connectivity (any broker) | NOT IMPLEMENTED — no broker configured, no credentials, no verified API contract; live status NOT_CONFIGURED |
 | Structured memory + evidence registry (1.1: category gate, unique + independent evidence, quarantine on reload) | IMPLEMENTED |
 | Research log persistence (1.1: locked criteria and hypothesis count survive restarts) | IMPLEMENTED |
 | Claude output schema, roles, MOCK and file-exchange reasoning clients | IMPLEMENTED |

@@ -337,13 +337,15 @@ def test_live_execution_cannot_be_constructed_whatever_the_data(tmp_path):
     from ati.core.time import FixedClock
     from ati.execution.engine import ExecutionEngine
     from ati.risk.engine import ApprovalAuthority
+    from ati.risk.killswitch import KillSwitch
 
     class LiveVenue:
         mode = OperatingMode.LIVE
     for status in DataStatus:
         with pytest.raises(LiveTradingDisabled):
             ExecutionEngine(LiveVenue(), tmp_path / f"e-{status.value}.jsonl", ApprovalAuthority(), FixedClock(T0),
-                            mode=OperatingMode.LIVE, data_status=status, initial_cash=Decimal(1))
+                            mode=OperatingMode.LIVE, data_status=status, initial_cash=Decimal(1),
+                            kill_switch=KillSwitch(tmp_path / "k.json", FixedClock(T0)))
 
 
 # --- provider input is untrusted ----------------------------------------------------------------------------
