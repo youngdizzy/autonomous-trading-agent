@@ -73,3 +73,30 @@ NOT_RUN (INSUFFICIENT DATA) until ~125 days of hourly payloads have been archive
 
 Not a bottleneck. Future concern before automation: polling with a 300-bar window archives ~64 KB per
 call; incremental `since` polling is needed before an hourly schedule.
+
+
+## Phase 3 — evidence accumulation (operational)
+
+```bash
+python -m ati accumulate  --state-dir ./real --data kraken   # BTC/USD, ETH/USD × 1h, 4h; exit 3 if any series failed
+python -m ati data-health --state-dir ./real --data kraken   # read-only scorecard, gaps, conflicts, sealed holdouts
+python -m ati company readiness --state-dir ./real --data kraken
+python -m ati verify --state-dir ./real
+```
+
+- **Canonical persistence** is the payload archive: every raw provider response is journaled write-ahead
+  in `evidence.jsonl`. The candle store is rebuilt at startup by re-parsing those exact bytes, in journal
+  order, with their original receipt times. Candles, provenance, dataset identities, ordering and conflict
+  state therefore reconstruct exactly. Sealed holdout periods are restored from `research.jsonl`, and each is
+  re-verified against its sealed content commitment.
+- **Runs after the first** re-request a fixed overlap (24 × 1h, 6 × 4h) before the last stored bar. Recent
+  history is re-checked for conflicts every run, and the archive grows by ≈ 11 KiB per run for all four
+  series, instead of ≈ 440 KB with full-window polling.
+- **Conflicts**: a provider answer that contradicts recorded history is archived and rejected, and the series
+  is marked DATA_CONFLICT. It stays blocked, even across restarts, until an operator acknowledges it with the
+  exact phrase in `ati.market.archive.CONFLICT_ACK`. The recorded history is never replaced.
+- **Gaps** are reported with their locations and never filled. Research windows are contiguous runs outside
+  every sealed holdout, and the research preconditions refuse any dataset that contains a gap.
+- **Blocked here.** api.kraken.com is denied by this environment's network policy (proxy 403 on CONNECT).
+  That is an environment permission, not a code change: allow `api.kraken.com` in the cloud environment's
+  network settings.

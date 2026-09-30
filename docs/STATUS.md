@@ -19,6 +19,13 @@ Vocabulary is exact. Nothing below is upgraded from one state to another.
 | Research preconditions → NOT_RUN; one run per hypothesis | IMPLEMENTED |
 | Pre-declared REAL research protocol (`REAL-PROTOCOL-001`) | IMPLEMENTED; REAL RESEARCH RUN = NOT_RUN (no REAL data) |
 | `ati ingest-kraken` / `ati research-real` | IMPLEMENTED — EXTERNAL VERIFICATION BLOCKED |
+| Incremental accumulation BTC/USD + ETH/USD × 1h + 4h (`ati accumulate`: per-series isolation, overlap re-check, durable run records) | IMPLEMENTED — EXTERNAL VERIFICATION BLOCKED (api.kraken.com proxy 403, re-confirmed 2026-09-30); verified with a Kraken-shaped MOCK feed |
+| Durable historical-conflict state (series blocked until operator acknowledgement; history never overwritten) | IMPLEMENTED |
+| Concurrency safety (state-directory lock; journals refuse appends after outside growth) | IMPLEMENTED |
+| Series health, gap reporting, sealed-holdout commitment re-verification, dataset scorecard (`ati data-health`, readiness) | IMPLEMENTED |
+| Research on gapped data | Refused (DATA_GAP); research windows are contiguous, unsealed runs |
+| REAL candles accumulated | NONE — REAL_DATA_UNAVAILABLE |
+| REAL research readiness (3,000-candle protocol minimum) | REAL_DATA_UNAVAILABLE; Kraken's OHLC endpoint returns ≤ 720 bars, so reaching 3,000 1h bars needs ~95 days of uninterrupted hourly accumulation (deep backfill NOT IMPLEMENTED) |
 | stdlib HTTPS transport | IMPLEMENTED — EXTERNAL VERIFICATION BLOCKED |
 | Deep historical backfill (Kraken Trades endpoint or other) | NOT IMPLEMENTED |
 | Fail-closed historical store | IMPLEMENTED |

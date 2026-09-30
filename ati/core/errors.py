@@ -136,3 +136,7 @@ class MalformedResponse(ProviderError):
 
 class SecretLeakError(AtiError):
     """A registered secret was about to be persisted, logged, or sent to a prompt."""
+
+
+class StateLocked(AtiError):
+    """Another process holds the state directory. Nothing was written."""

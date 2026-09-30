@@ -43,7 +43,12 @@ def report(cp) -> dict:
         research_error = f"{type(exc).__name__}: {exc}"[:300]
     champion = s.strategies.champion()
 
-    data = {"category": s.data_status.value, "market_evidence": s.data_status in MARKET_EVIDENCE_STATUSES,
+    from ati.market.accumulate import SERIES
+    from ati.market.health import scorecard, verify_sealed_holdouts
+
+    data = {"scorecard": scorecard(s, SERIES, champion.definition_hash if champion else None),
+            "sealed_holdouts": verify_sealed_holdouts(s),
+            "category": s.data_status.value, "market_evidence": s.data_status in MARKET_EVIDENCE_STATUSES,
             "provider": s.provider.name, "health": health.as_dict()["checks"]["data"], "data_state": health.data_state.value,
             "open_conflicts": sorted(cp.conflicts.open),
             "datasets": {sym: {"dataset_hash": ds.dataset_id, "bars": len(ds),

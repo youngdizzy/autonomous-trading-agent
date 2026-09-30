@@ -28,6 +28,9 @@ from ati.ledger.journal import Journal, decode
 from ati.market.models import MARKET_EVIDENCE_STATUSES, DataStatus, Timeframe
 
 
+CONFLICT_ACK = "OPERATOR: historical conflict reviewed; recorded history kept unchanged"
+
+
 def _parser(provider: str):
     if provider == "kraken":
         from ati.market.kraken import parse_ohlc
@@ -46,6 +49,10 @@ class PayloadArchive:
         self._payloads: dict[str, dict] = {}                     # digest → first full payload entry
         self._receipts: dict[tuple[str, datetime], dict] = {}    # (digest, received_at) → receipt, journal order
         self._rejected: set[str] = set()
+        # Historical conflicts are durable state: a payload that contradicted recorded history blocks its
+        # series until an operator acknowledges it. Recorded history is never overwritten either way.
+        self._conflicts: dict[str, dict] = {}          # digest → {series, reason}
+        self._resolved: set[str] = set()
         for entry in journal.entries():
             if entry.type in ("provider_payload", "provider_payload_receipt"):
                 p = decode(entry.payload)
@@ -54,6 +61,10 @@ class PayloadArchive:
                 self._receipts.setdefault((p["raw_sha256"], p["received_at"]), p)
             elif entry.type == "provider_payload_rejected":
                 self._rejected.add(entry.payload["raw_sha256"])
+                if entry.payload["reason"].startswith("historical conflict"):
+                    self._conflicts[entry.payload["raw_sha256"]] = {"reason": entry.payload["reason"]}
+            elif entry.type == "provider_conflict_acknowledged":
+                self._resolved.add(entry.payload["raw_sha256"])
 
     def record(self, *, provider: str, symbol: str, timeframe: Timeframe, url: str, params: dict[str, str],
                received_at: datetime, raw: bytes, status: DataStatus) -> str:
@@ -79,6 +90,36 @@ class PayloadArchive:
         if digest not in self._rejected:
             self.journal.append("provider_payload_rejected", {"raw_sha256": digest, "reason": reason[:300]})
             self._rejected.add(digest)
+
+    def conflicts(self, open_only: bool = True) -> list[dict]:
+        """Historical conflicts (payloads that disagreed with recorded history), with their series."""
+        out = []
+        for digest, c in self._conflicts.items():
+            if open_only and digest in self._resolved:
+                continue
+            p = self._payloads.get(digest, {})
+            out.append({"raw_sha256": digest, "provider": p.get("provider"), "symbol": p.get("symbol"),
+                        "timeframe": p.get("timeframe"), "reason": c["reason"], "acknowledged": digest in self._resolved})
+        return out
+
+    def series_conflicted(self, provider: str, symbol: str, timeframe: Timeframe) -> bool:
+        return any((c["provider"], c["symbol"], c["timeframe"]) == (provider, symbol, timeframe.value)
+                   for c in self.conflicts())
+
+    def acknowledge_conflict(self, digest: str, acknowledgement: str) -> None:
+        """Operator only. Unblocks the series; the disagreeing payload stays archived AND rejected, and the
+        recorded history stays exactly as it was (never replaced by the disagreeing values)."""
+        if acknowledgement != CONFLICT_ACK:
+            raise PermissionError("acknowledging a historical conflict requires the exact operator phrase")
+        if digest not in self._conflicts:
+            raise ProvenanceError(f"no historical conflict for payload {digest[:12]}")
+        if digest not in self._resolved:
+            self.journal.append("provider_conflict_acknowledged", {"raw_sha256": digest, "source": "operator"})
+            self._resolved.add(digest)
+
+    def receipts_for(self, provider: str, symbol: str, timeframe: Timeframe) -> list[dict]:
+        return [r for r in self._receipts.values()
+                if (r["provider"], r["symbol"], r["timeframe"]) == (provider, symbol, timeframe.value)]
 
     def __len__(self) -> int:
         return len(self._payloads)
@@ -114,6 +155,7 @@ class PayloadArchive:
             for digest in {c.provenance.raw_sha256 for c in batch if c.provenance.raw_sha256}:
                 if digest in self._payloads:
                     self.reject(digest, f"historical conflict: {exc}")
+                    self._conflicts.setdefault(digest, {"reason": f"historical conflict: {exc}"[:300]})
             raise
 
     def verify_market_provenance(self, dataset) -> None:

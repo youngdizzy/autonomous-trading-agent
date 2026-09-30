@@ -18,8 +18,9 @@ A row failing any condition is kept as an open (forming) candle, which research 
 
 Response checks (fail closed, never repaired): error envelope, exactly one pair key matching the
 requested pair, integer times strictly increasing (no duplicates, no reordering), numeric strings
-for prices and volume, candle invariants, and — for responses with at least 10 rows — at least one
-step equal to the requested interval.
+for prices and volume, candle invariants, every row time aligned to the requested interval, every row
+spacing a whole number of intervals and at least one spacing exactly one interval (a 4h response can
+never be accepted as 1h data, however short).
 
 Provenance: candles carry the *transport's* ``data_status`` (only the real network transport
 declares REAL) and the SHA-256 of the raw response text. When an archive is attached, the raw
@@ -106,8 +107,15 @@ def parse_ohlc(payload: Any, raw: bytes, symbol: str, timeframe: Timeframe, rece
             raise MalformedResponse(f"row {index} time not strictly increasing (duplicate or reordered)")
         times.append(row[0])
     step = timeframe.seconds
-    if len(times) >= 10 and not any(b - a == step for a, b in zip(times, times[1:])):
-        raise MalformedResponse(f"no consecutive rows {step}s apart: response is not {timeframe.value} data")
+    misaligned = [t for t in times if t % step]
+    if misaligned:   # same failure the candle gate raises for a single misaligned bar
+        raise DataIntegrityError("ALIGNMENT", f"row time {misaligned[0]} not aligned to {timeframe.value} boundaries")
+    steps = [b - a for a, b in zip(times, times[1:])]
+    if steps and step not in steps:
+        # Every spacing is a whole number of intervals (alignment above); at least one must be exactly one
+        # interval, so data of another timeframe (e.g. 4h rows answering a 1h request) is refused even in short
+        # responses. Larger spacings are gaps: recorded by data health, never filled.
+        raise MalformedResponse(f"row spacing {sorted(set(steps))[:3]}s is not {timeframe.value} data")
     provenance = Provenance(
         source="kraken",
         method=f"GET {OHLC_URL} pair={PAIR_QUERY.get(symbol)} interval={INTERVAL_MINUTES[timeframe]}",

@@ -4,6 +4,8 @@
     python -m ati verify --state-dir DIR   verify every journal's hash chain
     python -m ati ingest-kraken --state-dir DIR   read-only Kraken OHLC fetch → REAL payload archive
     python -m ati research-real --state-dir DIR   the pre-declared REAL research protocol, run once
+    python -m ati accumulate --state-dir DIR --data kraken|mock   BTC/ETH × 1h/4h incremental accumulation
+    python -m ati data-health --state-dir DIR --data kraken|mock  read-only dataset scorecard and health
     python -m ati company cycle|status|pause|resume --state-dir DIR --data mock|kraken
                                                   one bounded company control-plane cycle (no loop, no daemon)
 
@@ -171,6 +173,56 @@ def research_real(state_dir: Path) -> int:
     return 0
 
 
+def _data_system(state_dir: Path, data: str):
+    """``kraken``: the REAL system (network transport; REAL only if the provider actually answers).
+    ``mock``: MOCK provider — no archive, nothing persisted, history regenerated deterministically."""
+    from ati.agent.reasoning import FileExchangeClient
+    from ati.core.time import SystemClock
+
+    if data == "kraken":
+        return _real_system(state_dir)
+    clock = SystemClock()
+    provider = MockProvider(DEMO_SEED, clock, epoch=DEMO_START)
+    return build_paper_system(state_dir, clock, provider, FileExchangeClient(state_dir / "exchange"),
+                              data_status=provider.data_status)
+
+
+def accumulate_cmd(state_dir: Path, data: str) -> int:
+    from ati.core.errors import AtiError as _AtiError
+    from ati.core.lock import StateLock
+    from ati.market.accumulate import accumulate
+
+    try:
+        with StateLock(state_dir):
+            s = _data_system(state_dir, data)
+            results = accumulate(s)
+    except _AtiError as exc:
+        print(f"ACCUMULATION REFUSED — nothing written: {type(exc).__name__}: {exc}")
+        return 5
+    print(f"== ACCUMULATION ({s.data_status.value} via {s.provider.name}) ==")
+    for r in results:
+        print(json.dumps(r.__dict__, default=str))
+    return 0 if all(r.status in ("ACCUMULATED", "NO_NEW_DATA") for r in results) else 3
+
+
+def data_health_cmd(state_dir: Path, data: str) -> int:
+    from ati.core.errors import AtiError as _AtiError
+    from ati.market.accumulate import SERIES
+    from ati.market.health import scorecard, verify_sealed_holdouts
+
+    try:
+        s = _data_system(state_dir, data)
+    except _AtiError as exc:
+        print(f"DATA STATE UNTRUSTWORTHY: {type(exc).__name__}: {exc}")
+        return 5
+    champion = s.strategies.champion()
+    print(json.dumps({"category": s.data_status.value, "provider": s.provider.name,
+                      "datasets": scorecard(s, SERIES, champion.definition_hash if champion else None),
+                      "sealed_holdouts": verify_sealed_holdouts(s),
+                      "open_conflicts": s.archive.conflicts()}, indent=2, default=str))
+    return 0
+
+
 def _company(state_dir: Path, data: str):
     """Control plane over a PAPER system. ``kraken``: REAL data via the network transport (BLOCKED here).
     ``mock``: MOCK data (fixed seed and epoch so the realization is stable across invocations)."""
@@ -188,6 +240,21 @@ def _company(state_dir: Path, data: str):
 
 
 def company(cmd: str, state_dir: Path, data: str, ack: str | None, max_cycles: int = 1) -> int:
+    from ati.core.errors import AtiError as _AtiError
+
+    from ati.core.lock import StateLock
+
+    if cmd in ("cycle", "run", "pause", "resume"):   # writers hold the state lock for the whole command
+        try:
+            with StateLock(state_dir):
+                return _company_cmd(cmd, state_dir, data, ack, max_cycles)
+        except _AtiError as exc:
+            print(f"COMPANY REFUSED — nothing written: {type(exc).__name__}: {exc}")
+            return 5
+    return _company_cmd(cmd, state_dir, data, ack, max_cycles)
+
+
+def _company_cmd(cmd: str, state_dir: Path, data: str, ack: str | None, max_cycles: int) -> int:
     from ati.core.errors import AtiError as _AtiError
 
     try:
@@ -261,6 +328,11 @@ def main(argv: list[str] | None = None) -> int:
     k.add_argument("--symbol", default="BTC/USD")
     r = sub.add_parser("research-real", help="run the pre-declared REAL research protocol once")
     r.add_argument("--state-dir", type=Path, required=True)
+    for name, text in (("accumulate", "BTC/ETH × 1h/4h incremental accumulation through the payload archive"),
+                       ("data-health", "read-only dataset scorecard, health and sealed-holdout verification")):
+        a = sub.add_parser(name, help=text)
+        a.add_argument("--state-dir", type=Path, required=True)
+        a.add_argument("--data", choices=["mock", "kraken"], required=True)
     c = sub.add_parser("company", help="company control plane: one bounded cycle, status, pause, resume")
     c.add_argument("action", choices=["cycle", "run", "status", "readiness", "report", "pause", "resume"])
     c.add_argument("--state-dir", type=Path, required=True)
@@ -271,7 +343,13 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "company":
         return company(args.action, args.state_dir, args.data, args.ack, args.max_cycles)
     if args.cmd == "ingest-kraken":
-        return ingest_kraken(args.state_dir, args.symbol)
+        from ati.core.lock import StateLock
+        with StateLock(args.state_dir):
+            return ingest_kraken(args.state_dir, args.symbol)
+    if args.cmd == "accumulate":
+        return accumulate_cmd(args.state_dir, args.data)
+    if args.cmd == "data-health":
+        return data_health_cmd(args.state_dir, args.data)
     if args.cmd == "research-real":
         return research_real(args.state_dir)
     if args.cmd == "demo":

@@ -69,6 +69,7 @@ class Journal:
         self.fsync = fsync
         self._entries: list[JournalEntry] = []
         self._broken = False
+        self._size = 0   # bytes this object has read or written; any other growth means another writer
         if self.path.exists() and self.path.stat().st_size > 0:
             self._load()
             header = self._entries[0].payload
@@ -81,6 +82,7 @@ class Journal:
     # --- reading ------------------------------------------------------------------------
     def _load(self) -> None:
         raw = self.path.read_bytes()
+        self._size = len(raw)
         if not raw.endswith(b"\n"):
             raise JournalCorruption(f"{self.path}: truncated final entry (interrupted write)")
         prev = GENESIS
@@ -102,7 +104,7 @@ class Journal:
     def verify(self) -> None:
         """Re-read the file from disk and check it matches the in-memory chain."""
         disk = Journal.__new__(Journal)
-        disk.path, disk._entries = self.path, []
+        disk.path, disk._entries, disk._size = self.path, [], 0
         disk._load()
         if [e.hash for e in disk._entries] != [e.hash for e in self._entries]:
             raise JournalCorruption(f"{self.path}: on-disk history diverges from recorded history")
@@ -137,8 +139,15 @@ class Journal:
         digest = _entry_hash(seq, at, type_, canonical_payload, prev)
         line = json.dumps({"seq": seq, "at": at, "type": type_, "payload": canonical_payload, "prev": prev, "hash": digest},
                           sort_keys=True, separators=(",", ":"), ensure_ascii=False) + "\n"
+        on_disk = self.path.stat().st_size if self.path.exists() else 0
+        if on_disk != self._size:
+            # Another process (or a hand edit) changed the file since this object last read or wrote it.
+            # Appending now would fork the hash chain; refuse instead (fail closed, nothing written).
+            raise JournalWriteError(f"{self.path}: on-disk journal changed outside this writer "
+                                    f"({on_disk} bytes, expected {self._size}); reopen before appending")
         try:
             self._write_line(line)
+            self._size += len(line.encode("utf-8"))
         except OSError as exc:
             self._broken = True
             raise JournalWriteError(f"{self.path}: write failed: {exc}") from exc

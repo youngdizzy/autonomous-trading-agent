@@ -86,6 +86,8 @@ def research_preconditions(system, full: Dataset, base: StrategyDefinition, *, h
         failures.append(f"partition {ident.partition.value}; a research cycle starts from a FULL dataset")
     if not all(c.is_closed for c in full.candles):
         failures.append("forming candles present")
+    if ident.gaps:   # crypto trades continuously: missing intervals are never filled, and never bridged by research
+        failures.append(f"DATA_GAP: {ident.gaps} missing interval(s) inside the dataset; research needs a contiguous run")
     if ident.n_candles < min_candles:
         failures.append(f"INSUFFICIENT DATA: {ident.n_candles} candles < {min_candles} required by the protocol")
     try:

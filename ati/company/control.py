@@ -44,6 +44,7 @@ from ati.data.dataset import Dataset, Partition, sealed_ranges
 from ati.decision.records import make_decision_id
 from ati.ledger.journal import Journal, decode
 from ati.market.conflict import ConflictRegister
+from ati.market.health import contiguous_runs
 from ati.memory.store import MemoryKind
 from ati.research import conditions as conditions_mod
 from ati.research import diagnostics
@@ -501,10 +502,12 @@ class CompanyControlPlane:
                 current.append(c)
         if current:
             segments.append(current)
+        # gaps split windows exactly like sealed periods do: a research window is one contiguous, unsealed run
+        segments = [run for seg in segments for run in contiguous_runs(seg)]
         need = int(P.MIN_CANDLES * (1 - P.HOLDOUT_FRACTION)) if diagnostic else P.MIN_CANDLES
         latest = segments[-1] if segments else []
         if len(latest) < need:
-            return (f"INSUFFICIENT DATA outside sealed holdout periods: latest unsealed run has {len(latest)} bars "
+            return (f"INSUFFICIENT DATA outside sealed holdout periods: latest contiguous unsealed run has {len(latest)} bars "
                     f"< {need} required ({len(sealed)} holdout period(s) already used)")
         full = Dataset.build(latest, data_version="company-store",
                              realization=getattr(self.s.provider, "realization", "observed"))

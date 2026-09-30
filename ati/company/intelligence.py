@@ -26,7 +26,9 @@ def report(cp, day: datetime | None = None) -> dict:
     s = cp.s
     now = s.clock.now()
     day_s = (day or now).date().isoformat()
-    label = f"{s.data_status.value} data / {s.execution.mode.value} execution"
+    has_data = any(s.store.series(s.provider.name, sym, s.timeframe) for sym in s.symbols)
+    label = (f"{s.data_status.value} data / {s.execution.mode.value} execution" if has_data else
+             f"NO DATA (system bound to {s.data_status.value}) / {s.execution.mode.value} execution")
     market = s.data_status in MARKET_EVIDENCE_STATUSES
 
     ends = [e for e in cp.journal.entries("cycle_end")]
