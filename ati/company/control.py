@@ -53,6 +53,7 @@ from ati.research.hypothesis import Criterion, PreRegistration, ResearchLog
 from ati.research.walkforward import walk_forward
 from ati.research.workflow import run_research_cycle
 from ati.strategies.base import StrategyDefinition
+from ati.strategies.registry import Lifecycle
 from ati.validation.promotion import PromotionPolicy
 
 
@@ -388,6 +389,7 @@ class CompanyControlPlane:
                           "recovered": True, "experiment_id": cyc.steps["research_invoked"].get("experiment_id")}
                 if exp is not None and exp.type in CANDIDATE_EXPERIMENTS:
                     detail["comparison"] = self._compare(spec, base, log)
+                detail.update(self._recover_candidate(spec, log, cyc.steps["research_invoked"].get("experiment_id")))
                 self._link(spec)
                 return "COMPLETED", detail
             return "BLOCKED", {"reason": f"{spec.hypothesis_id} is already registered ({log.status(spec.hypothesis_id)}); "
@@ -419,6 +421,7 @@ class CompanyControlPlane:
                                              f"used): {exc}"[:300]}
             grid = [candidate_def.param_dict]
         diagnostic = exp is not None and exp.type in DIAGNOSTIC_EXPERIMENTS
+        observation_refs = self._observation_refs(spec)
         registered = self._registered(base)
         series = s.store.series(s.provider.name, P.SYMBOL, P.TIMEFRAME)
         window = self._window(series, diagnostic)
@@ -458,28 +461,22 @@ class CompanyControlPlane:
             s.research_journal.append("experiment_design", design | {"experiment_id": exp_id,
                                                                      "dataset_id": full.dataset_id})
         if diagnostic:
-            detail = self._diagnostic(spec, exp, base, full, boundary, criteria)
+            detail = self._diagnostic(spec, exp, base, full, boundary, criteria, observation_refs)
             self._link(spec)
             return "COMPLETED", detail | {"experiment_id": exp_id}
         adversarial, promotion = self.research_policies
         r = run_research_cycle(s, full, boundary, hypothesis_id=spec.hypothesis_id, statement=spec.statement,
                                base=candidate_def or base, grid=grid, criteria=tuple(criteria),
                                train_bars=P.TRAIN_BARS, test_bars=P.TEST_BARS, adversarial_policy=adversarial,
-                               promotion_policy=promotion, min_candles=P.MIN_CANDLES)
+                               promotion_policy=promotion, min_candles=P.MIN_CANDLES, observation_refs=observation_refs)
         detail = {"hypothesis_id": spec.hypothesis_id, "experiment_id": exp_id, "research_status": r.status,
                   "reasons": list(r.reasons), "dev_verdict": r.dev_verdict and r.dev_verdict.value,
                   "holdout_verdict": r.holdout_verdict and r.holdout_verdict.value,
                   "promotion_approved": r.promotion.approved if r.promotion else None,
                   "research_window": {"dataset_id": full.dataset_id, "bars": len(full)}}
         if r.challenger_key:
-            challenger = s.strategies.get(r.challenger_key)
-            dev_id = next((e["dataset_id"] for e in ResearchLog(s.research_journal).experiments
-                           if e["hypothesis_id"] == spec.hypothesis_id and e["stage"] == "walk_forward_oos"), None)
-            factory.record_lineage(s, challenger, hypothesis_id=spec.hypothesis_id, experiment_id=exp_id,
-                                   dev_dataset_id=dev_id, full_dataset_id=full.dataset_id,
-                                   baseline_hash=registered.definition_hash if registered else None)
-            detail["candidate"] = {"key": challenger.key, "fingerprint": challenger.definition_hash,
-                                   "parent_fingerprint": challenger.parent_hash}
+            detail["candidate"] = self._persist_candidate(spec.hypothesis_id, r.challenger_key, exp_id, full.dataset_id,
+                                                          registered.definition_hash if registered else None)
         if exp is not None and exp.type in CANDIDATE_EXPERIMENTS and r.dev_verdict is not None:
             detail["comparison"] = self._compare(spec, base, ResearchLog(s.research_journal), full, boundary)
         self._link(spec)
@@ -523,7 +520,13 @@ class CompanyControlPlane:
         elif candidate_def is not None:
             candidate = {"strategy_id": candidate_def.strategy_id, "kind": candidate_def.kind,
                          "params": candidate_def.param_dict, "code_hash": candidate_def.code_hash}
+        changed = None
+        if exp.candidate_params is not None:
+            cp = dict(exp.candidate_params)
+            changed = [{"variable": k, "baseline": P.BASE_PARAMS[k], "candidate": cp[k]}
+                       for k in sorted(cp) if cp[k] != P.BASE_PARAMS[k]]
         return {"hypothesis_id": spec.hypothesis_id, "type": exp.type, "design_rationale": exp.design_rationale,
+                "changed_variables": changed,
                 "independent_variables": list(exp.independent_variables), "dependent_variable": exp.dependent_variable,
                 "controls": exp.controls, "failure_criteria": exp.failure_criteria,
                 "stopping_criteria": exp.stopping_criteria,
@@ -536,14 +539,14 @@ class CompanyControlPlane:
                 "compute_units": compute, "objective_contract": objectives.CONTRACT.contract_hash,
                 "budget_policy": budget.POLICY.policy_hash}
 
-    def _diagnostic(self, spec, exp, base, full, boundary, criteria) -> dict:
+    def _diagnostic(self, spec, exp, base, full, boundary, criteria, observation_refs=()) -> dict:
         """REGIME / EXECUTION / RISK: pre-registered, development partition only, recorded like any experiment,
         and never a candidate: no challenger, no holdout, no promotion."""
         s = self.s
         dev = Dataset.build([c for c in full.candles if c.close_time <= boundary], data_version=full.identity.data_version,
                             realization=full.identity.realization, partition=Partition.DEVELOPMENT)
         log = ResearchLog(s.research_journal)
-        prereg = PreRegistration(spec.hypothesis_id, spec.statement, tuple(spec.evidence_refs), base.key,
+        prereg = PreRegistration(spec.hypothesis_id, spec.statement, tuple(observation_refs), base.key,
                                  base.definition_hash, dev.dataset_id, tuple(criteria),
                                  self.research_policies[0].min_oos_trades, s.clock.now())
         log.preregister(prereg)
@@ -570,6 +573,49 @@ class CompanyControlPlane:
         return {"hypothesis_id": spec.hypothesis_id, "research_status": "COMPLETED", "dev_verdict": verdict.value,
                 "holdout_verdict": None, "promotion_approved": None, "diagnostic": facts,
                 "n_trades": metrics.n_trades, "expectancy_r": metrics.expectancy_r}
+
+    def _observation_refs(self, spec) -> tuple[str, ...]:
+        """Provenance locked into the pre-registration: the learning candidate and the registered evidence behind
+        it (added deterministically, not taken from Claude), plus Claude's own validated evidence refs."""
+        refs: list[str] = []
+        lc = spec.learning_candidate_id
+        if lc is not None and lc in self.learning.candidates:
+            refs.append(f"learning:{lc}")
+            refs += [i for i in self.learning.candidates[lc].evidence if i in self.s.evidence][:12]
+        refs += [r for r in spec.evidence_refs if r not in refs]
+        return tuple(refs)
+
+    def _persist_candidate(self, hypothesis_id, challenger_key, exp_id, full_dataset_id, baseline_hash) -> dict:
+        s = self.s
+        challenger = s.strategies.get(challenger_key)
+        dev_id = next((e["dataset_id"] for e in ResearchLog(s.research_journal).experiments
+                       if e["hypothesis_id"] == hypothesis_id and e["stage"] == "walk_forward_oos"), None)
+        factory.record_lineage(s, challenger, hypothesis_id=hypothesis_id, experiment_id=exp_id, dev_dataset_id=dev_id,
+                               full_dataset_id=full_dataset_id, baseline_hash=baseline_hash)
+        return {"key": challenger.key, "fingerprint": challenger.definition_hash, "parent_fingerprint": challenger.parent_hash,
+                "candidate_id": factory.candidate_id(challenger.definition_hash, hypothesis_id)}
+
+    def _recover_candidate(self, spec, log: ResearchLog, exp_id) -> dict:
+        """After a crash inside a research run: persist missing lineage (idempotent) and report — never re-run,
+        never re-evaluate the holdout, never apply a promotion. A challenger left mid-review is reported for a new
+        promotion review rather than being promoted or rejected by recovery code."""
+        s = self.s
+        hold_id = spec.hypothesis_id + ":holdout"
+        if log.status(hold_id) == "UNKNOWN":
+            return {}
+        fingerprint = log.get(hold_id).strategy_hash
+        key = next((k for k in s.strategies.keys() if s.strategies.get(k).definition_hash == fingerprint), None)
+        if key is None:
+            return {}
+        out = {"candidate": self._persist_candidate(spec.hypothesis_id, key, exp_id, None, None)}
+        promos = [decode(e.payload)["record"] for e in s.research_journal.entries("promotion_decision")
+                  if e.payload["record"]["challenger_hash"] == fingerprint]
+        state = s.strategies.state(key).value
+        if state == "CHALLENGER" and promos:
+            out["requires_review"] = (f"{key} is still CHALLENGER after a recorded promotion decision "
+                                      f"({'approved' if promos[-1]['approved'] else 'denied'}) — the run was interrupted; "
+                                      "recovery does not apply or reverse promotions")
+        return out
 
     def _link(self, spec) -> None:
         if spec.learning_candidate_id is not None:
@@ -618,6 +664,8 @@ class CompanyControlPlane:
         cand_base = base if cd["strategy_id"] == base.strategy_id else StrategyDefinition.create(
             cd["strategy_id"], 1, cd["kind"], cd["params"], P.TIMEFRAME, s.clock.now())
         cand_wf = walk_forward(cand_base, dev, [cd["params"]], train_bars=P.TRAIN_BARS, test_bars=P.TEST_BARS)
+        registered_cand = self._registered_with(cand_base, cd["params"])
+        cand_def_hash = registered_cand.definition_hash if registered_cand else None
         if cand_wf.evidence_hash != row["evidence_hash"]:
             return {"conclusion": "NOT_AVAILABLE", "reason": "candidate walk-forward does not reproduce the recorded evidence"}
         baseline = walk_forward(base, dev, [dict(P.BASE_PARAMS)], train_bars=P.TRAIN_BARS, test_bars=P.TEST_BARS)
@@ -635,12 +683,13 @@ class CompanyControlPlane:
         result = objectives.compare(baseline.oos_metrics, cand_wf.oos_metrics, verdicts, extra=extra)
         s.research_journal.append("experiment_comparison", {
             "hypothesis_id": spec.hypothesis_id, "experiment_id": design.get("experiment_id"),
-            "baseline_strategy": base.key, "baseline_fingerprint": design["baseline"]["fingerprint"],
-            "baseline_dataset": dev.dataset_id, "baseline_results": baseline.oos_metrics,
+            "baseline_strategy_id": base.key, "baseline_fingerprint": design["baseline"]["fingerprint"],
+            "baseline_dataset_identity": dev.dataset_id, "baseline_result": baseline.oos_metrics,
             "baseline_evidence": baseline.evidence_hash,
-            "candidate_strategy": f"{cd['strategy_id']}:{sorted(cd['params'].items())}",
-            "candidate_fingerprint": challenger_hash, "candidate_dataset": dev.dataset_id,
-            "candidate_results": cand_wf.oos_metrics, "candidate_evidence": row["evidence_hash"],
+            "candidate_strategy_id": f"{cd['strategy_id']}:{sorted(cd['params'].items())}",
+            "candidate_fingerprint": challenger_hash or cand_def_hash, "candidate_dataset_identity": dev.dataset_id,
+            "candidate_result": cand_wf.oos_metrics, "candidate_evidence": row["evidence_hash"],
+            "attempts": factory.attempts(s, spec.hypothesis_id),
             "dev_dataset_id": dev.dataset_id, "verdicts": verdicts, **result,
             "baseline_replaced": False})
         return {"conclusion": result["conclusion"], "dimensions": result["dimensions"],
@@ -752,66 +801,85 @@ class CompanyControlPlane:
         return view
 
     def _context(self, cyc, request_id, health, datasets, candidates, marks, allowed, conditions=()) -> dict:
-        """Bounded, point-in-time context: summaries only — no journals, datasets, holdout or internals."""
+        """Bounded, deterministic, point-in-time context in named sections. Summaries and ids only — no journals,
+        datasets, holdout contents or internals. Every learning/memory item carries its evidence level explicitly
+        (VALIDATED_FINDING / SUPPORTED_PATTERN / HYPOTHESIS / OBSERVATION / REJECTED_HYPOTHESIS): memory informs,
+        evidence authorizes."""
         s = self.s
+        now = s.clock.now()
         champion = s.strategies.champion()
         log = self._research_log()
         prev = self.cycles.get(self.last_finished) if self.last_finished else None
+        memory = s.memory.query(now)
+        level = {"VALIDATED_FINDING": "VALIDATED_FINDING", "FINDING": "SUPPORTED_PATTERN", "HYPOTHESIS": "HYPOTHESIS",
+                 "REJECTED_HYPOTHESIS": "REJECTED_HYPOTHESIS", "MISTAKE": "SUPPORTED_PATTERN", "LESSON": "SUPPORTED_PATTERN"}
+        learning_level = {"VALIDATED_EFFECT": "VALIDATED_FINDING", "SUPPORTED_PATTERN": "SUPPORTED_PATTERN"}
+        learnings = [dict(r, evidence_level=learning_level.get(r["class"], "OBSERVATION"))
+                     for r in self.learning.summary(s)]
         return {
-            "request_id": request_id, "cycle_id": cyc.cycle_id, "allowed_actions": allowed,
-            "company": {"state": self.state.value, "paused": self.paused,
-                        "previous_cycle": {"cycle_id": prev.cycle_id, "status": prev.status,
-                                           "action": prev.result.get("action")} if prev else None},
-            "health": health.as_dict(),
-            "market": {sym: {"data_status": ds.identity.status.value, "latest_close": str(ds.candles[-1].close_time),
-                             "last_price": str(ds.candles[-1].close), "bars": len(ds)}
-                       for sym, ds in sorted(datasets.items())},
-            "portfolio": {"cash": str(s.execution.account.cash), "positions": self._positions(marks),
-                          "realized_pnl": str(s.execution.account.realized_pnl)},
-            "risk": {"kill_switch_engaged": s.kill_switch.state()["engaged"],
-                     "reconciliation": s.execution.recon_state.value,
-                     "max_risk_per_trade_fraction": str(s.limits.max_risk_per_trade_fraction)},
-            "strategy": {"champion": champion.key if champion else None,
+            "request_id": request_id, "cycle_id": cyc.cycle_id, "as_of": now.isoformat(), "allowed_actions": allowed,
+            "COMPANY_STATE": {
+                "state": self.state.value, "paused": self.paused,
+                "previous_cycle": {"cycle_id": prev.cycle_id, "status": prev.status,
+                                   "action": prev.result.get("action")} if prev else None,
+                "autonomy": {"level": self.autonomy.name, "maximum_permitted": autonomy.maximum_permitted().name},
+                "objective": {"primary": objectives.CONTRACT.primary_objective,
+                              "contract_hash": objectives.CONTRACT.contract_hash,
+                              "constraints": {"max_drawdown": objectives.CONTRACT.max_drawdown,
+                                              "min_trades": objectives.CONTRACT.min_trades,
+                                              "max_top5_profit_share": objectives.CONTRACT.max_top5_profit_share,
+                                              "max_cost_share_of_gross": objectives.CONTRACT.max_cost_share_of_gross},
+                              "required_evidence": list(objectives.CONTRACT.required_verdicts)}},
+            "DATA_HEALTH": {
+                "data_state": health.data_state.value, "data_check": health.as_dict()["checks"]["data"],
+                "market": {sym: {"data_status": ds.identity.status.value, "dataset_id": ds.dataset_id,
+                                 "latest_close": str(ds.candles[-1].close_time), "last_price": str(ds.candles[-1].close),
+                                 "bars": len(ds)} for sym, ds in sorted(datasets.items())},
+                "open_conflicts": sorted(self.conflicts.open)[:5],
+                "conditions": [{k: c[k] for k in ("assumption", "status", "statistic", "invalidates")} for c in conditions]},
+            "STRATEGY": {"champion": champion.key if champion else None,
                          "fingerprint": champion.definition_hash if champion else None,
                          "version": champion.version if champion else None,
                          "params": champion.param_dict if champion else None,
                          "entry_signals": {sym: {"cutoff": str(c[0].cutoff), "last_close": str(c[0].latest.close)}
                                            for sym, c in sorted(candidates.items())}},
-            "research": {"hypotheses_tested": log.hypotheses_tested if log else "UNAVAILABLE (research FAIL)",
-                         "recent": [{"hypothesis_id": e["hypothesis_id"], "stage": e["stage"], "verdict": e["verdict"]}
-                                    for e in (log.experiments[-5:] if log else [])],
-                         "protocols": [{"protocol_id": P.PROTOCOL_ID, "strategy_key": PROTOCOLS[P.PROTOCOL_ID],
-                                        "statement": P.STATEMENT, "min_bars": P.MIN_CANDLES,
-                                        "locked_minimum_criteria": [[c.metric, c.op, c.threshold] for c in P.CRITERIA]}]},
-            "memory": [{"kind": m.kind.value, "statement": m.statement, "confidence": m.confidence}
-                       for m in s.memory.query(s.clock.now())[-10:]],
-            # Self-improvement context: informs Claude; none of it authorizes anything.
-            "autonomy": {"level": self.autonomy.name, "maximum_permitted": autonomy.maximum_permitted().name},
-            "objective": {"primary": objectives.CONTRACT.primary_objective,
-                          "contract_hash": objectives.CONTRACT.contract_hash,
-                          "constraints": {"max_drawdown": objectives.CONTRACT.max_drawdown,
-                                          "min_trades": objectives.CONTRACT.min_trades,
-                                          "max_top5_profit_share": objectives.CONTRACT.max_top5_profit_share,
-                                          "max_cost_share_of_gross": objectives.CONTRACT.max_cost_share_of_gross},
-                          "required_evidence": list(objectives.CONTRACT.required_verdicts)},
-            "research_budget": self._budget_view(),
-            "scorecard": scorecard.build(s, health, self.journal, self.learning),
-            "learning_candidates": self.learning.summary(s),
-            "failed_experiments": [{"hypothesis_id": e["hypothesis_id"], "stage": e["stage"], "verdict": e["verdict"]}
-                                   for e in (log.experiments if log else []) if e["verdict"] != "PASS"][-8:],
-            "validated_findings": [{"statement": m.statement, "confidence": m.confidence}
-                                   for m in s.memory.query(s.clock.now()) if m.kind is MemoryKind.VALIDATED_FINDING][-5:],
-            "conditions": [{k: c[k] for k in ("assumption", "status", "statistic", "invalidates")} for c in conditions],
-            "recent_outcomes": [{"source": o.source, "at": o.at, "realized": o.realized, "deviation": o.deviation}
+            "RISK_STATE": {"kill_switch_engaged": s.kill_switch.state()["engaged"],
+                           "reconciliation": s.execution.recon_state.value,
+                           "max_risk_per_trade_fraction": str(s.limits.max_risk_per_trade_fraction),
+                           "limits_hash": s.limits.limits_hash, "owner": "code; not changeable by any action",
+                           "portfolio": {"cash": str(s.execution.account.cash), "positions": self._positions(marks),
+                                         "realized_pnl": str(s.execution.account.realized_pnl)}},
+            "RECENT_OUTCOMES": [{"outcome_id": o.outcome_id, "source": o.source, "at": o.at, "data_category": o.data_category,
+                                 "realized": o.realized, "deviation": o.deviation}
                                 for o in list(self.learning.outcomes.values())[-6:]],
-            "active_hypotheses": self._active_hypotheses(log),
-            "validation": self._validation_status(),
-            "experiment_protocol": {"candidate_types": sorted(CANDIDATE_EXPERIMENTS),
-                                    "diagnostic_types": sorted(DIAGNOSTIC_EXPERIMENTS),
-                                    "regime_labels": list(diagnostics.REGIME_LABELS),
-                                    "execution_bounds": diagnostics.EXECUTION_BOUNDS,
-                                    "risk_bounds": diagnostics.RISK_BOUNDS,
-                                    "baseline_params": PROTOCOL_PARAMS[P.PROTOCOL_ID]},
+            "RELEVANT_LEARNINGS": {
+                "learning_candidates": learnings,
+                "memory": [{"entry_id": m.entry_id, "evidence_level": level[m.kind.value], "statement": m.statement[:300],
+                            "confidence": m.confidence} for m in memory
+                           if m.kind.value not in ("VALIDATED_FINDING", "REJECTED_HYPOTHESIS")][-6:]},
+            "ACTIVE_HYPOTHESES": self._active_hypotheses(log),
+            "RECENT_EXPERIMENTS": [{"hypothesis_id": e["hypothesis_id"], "stage": e["stage"], "verdict": e["verdict"],
+                                    # holdout identities never enter Claude's context: evaluation-only, access-limited
+                                    "dataset_id": "SEALED_HOLDOUT" if e["stage"] == "holdout" else e["dataset_id"]}
+                                   for e in (log.experiments[-5:] if log else [])],
+            "FAILED_EXPERIMENTS": [{"hypothesis_id": e["hypothesis_id"], "stage": e["stage"], "verdict": e["verdict"]}
+                                   for e in (log.experiments if log else []) if e["verdict"] != "PASS"][-8:],
+            "REJECTED_HYPOTHESES": [{"entry_id": m.entry_id, "evidence_level": "REJECTED_HYPOTHESIS",
+                                     "statement": m.statement[:300]} for m in memory
+                                    if m.kind is MemoryKind.REJECTED_HYPOTHESIS][-6:],
+            "VALIDATED_FINDINGS": [{"entry_id": m.entry_id, "evidence_level": "VALIDATED_FINDING", "statement": m.statement,
+                                    "confidence": m.confidence} for m in memory
+                                   if m.kind is MemoryKind.VALIDATED_FINDING][-5:],
+            "CHALLENGERS": self._validation_status(),
+            "SYSTEM_HEALTH": {"health": health.as_dict(), "scorecard": scorecard.build(s, health, self.journal, self.learning)},
+            "RESEARCH_BUDGET": self._budget_view(),
+            "RESEARCH_PROTOCOL": {
+                "protocols": [{"protocol_id": P.PROTOCOL_ID, "strategy_key": PROTOCOLS[P.PROTOCOL_ID],
+                               "statement": P.STATEMENT, "min_bars": P.MIN_CANDLES,
+                               "locked_minimum_criteria": [[c.metric, c.op, c.threshold] for c in P.CRITERIA]}],
+                "candidate_types": sorted(CANDIDATE_EXPERIMENTS), "diagnostic_types": sorted(DIAGNOSTIC_EXPERIMENTS),
+                "regime_labels": list(diagnostics.REGIME_LABELS), "execution_bounds": diagnostics.EXECUTION_BOUNDS,
+                "risk_bounds": diagnostics.RISK_BOUNDS, "baseline_params": PROTOCOL_PARAMS[P.PROTOCOL_ID]},
         }
 
     def _active_hypotheses(self, log) -> list[dict]:
@@ -831,10 +899,14 @@ class CompanyControlPlane:
         s = self.s
         promos = [decode(e.payload)["record"] for e in s.research_journal.entries("promotion_decision")]
         latest = promos[-1] if promos else None
-        return {"latest_promotion": {"challenger": latest["challenger_key"], "approved": latest["approved"],
+        lineage = [e.payload for e in s.research_journal.entries("candidate_lineage")][-3:]
+        return {"registered_challengers": s.strategies.keys(Lifecycle.CHALLENGER),
+                "latest_promotion": {"promotion_id": factory.promotion_id(latest["record_hash"]),
+                                     "challenger": latest["challenger_key"], "approved": latest["approved"],
                                      "reasons": list(latest["reasons"])[:3]} if latest else "NOT_AVAILABLE",
-                "candidates": [factory.stages(s, e.payload["fingerprint"])["furthest_stage"]
-                               for e in s.research_journal.entries("candidate_lineage")][-5:]}
+                "recent_candidates": [{"candidate_id": l_["candidate_id"], "key": l_["key"], "hypothesis_id": l_["hypothesis_id"],
+                                       "furthest_stage": factory.stages(s, l_["fingerprint"])["furthest_stage"],
+                                       "attempts_before": l_.get("attempts")} for l_ in lineage]}
 
     def _budget_view(self) -> dict:
         s = self.s

@@ -55,7 +55,11 @@ def usage(system, company_journal, now: datetime, baseline_hash: str | None = No
     if statement is not None:
         same_idea = sum(1 for h in tested_roots if _norm(log.get(h).statement) == _norm(statement))
     rejected = sum(1 for h in tested_roots if log.status(h) in ("TESTED:FAIL", "TESTED:INSUFFICIENT_EVIDENCE"))
+    designed = {e.payload["hypothesis_id"] for e in s.research_journal.entries("experiment_design")
+                if e.payload.get("candidate")}
+    grid_challengers = {e.payload["hypothesis_id"] for e in s.research_journal.entries("candidate_lineage")} - designed
     return {"root_hypotheses_tested": log.hypotheses_tested, "experiments": len(log.experiments),
+            "experiments_run": len(log.experiments), "candidates_generated": len(designed) + len(grid_challengers),
             "rejected_hypotheses": rejected, "holdout_evaluations": holdouts, "variants_of_baseline": variants,
             "tests_of_this_idea": same_idea, "research_runs_today": runs_today, "compute_units_today": compute_today,
             "datasets_used": len({e["dataset_id"] for e in log.experiments}),

@@ -1,29 +1,26 @@
 """Outcome learning — the LEARN stage of the company cycle.
 
-    OUTCOME (journals) → OutcomeRecord (facts) → deterministic pattern detection → LearningCandidate
-      → [Claude may cite it in a RESEARCH_REQUEST] → PREREGISTERED → TESTING → SUPPORTED/REJECTED/INCONCLUSIVE
+    OUTCOME (journals) → OutcomeRecord (facts + provenance) → deterministic pattern detection → LEARNING CANDIDATE
+      → [Claude cites it in a designed RESEARCH_REQUEST] → PROMOTED_TO_HYPOTHESIS → existing pre-registration,
+        experiment, validation and promotion machinery (research status is read from the ResearchLog)
 
-Everything here is deterministic and derived from the existing journals:
-  - trade outcomes      loop journal ``trade_review`` (+ the decision's expected risk)
-  - research outcomes   research journal ``experiment`` rows and ``promotion_decision`` records
-  - data failures       loop journal ``data_unhealthy``
-  - contract failures   company journal ``rejected`` steps
+Sources, all existing journals: paper trades (loop ``trade_review`` + the decision record), experiments and
+promotion decisions (research journal), adversarial robustness findings, data failures, rejected Claude
+responses, and assumption-monitor shifts (company journal).
 
-A learning candidate is a *record*, never a rule. This module holds no reference to the strategy registry,
-risk engine or execution engine, so no learning path can change a strategy, a limit, or an order. The
-only way forward from a candidate is a pre-registered hypothesis through the research workflow.
+A learning candidate keeps FACT (what happened, computed from recorded outcomes), INTERPRETATION (what *may*
+explain it, a hedged template) and PROPOSED_QUESTION (what to test) apart. It is a record, never a rule: this
+module holds no reference to the strategy registry, risk engine or execution engine. Its only memory write is a
+non-doctrinal HYPOTHESIS entry through MemoryStore's evidence gates, once per recurring trade pattern.
 
-Evidence quality (deterministic, never Claude's opinion):
-  OBSERVATION        one supporting outcome
-  WEAK_EVIDENCE      two independent outcomes
-  REPEATED_EVIDENCE  three or more independent outcomes
-  SUPPORTED_EVIDENCE a pre-registered test of the linked hypothesis passed development and holdout
-  VALIDATED_EVIDENCE as SUPPORTED, on market-category data, with the promotion gate approving
-Outcomes count as independent only if they are distinct source events; stages of one experiment, and
-repeated observations of one event, count once.
+Status: OBSERVED → ANALYZED (2 outcomes) → HYPOTHESIS_CANDIDATE (3+) → PROMOTED_TO_HYPOTHESIS (linked hypothesis
+pre-registered); REJECTED when later matching outcomes contradict the pattern. Terminal states stay visible.
+Classification: ONE_OFF · POSSIBLE_PATTERN · RECURRING_PATTERN · SUPPORTED_PATTERN (linked hypothesis passed
+development and holdout) · VALIDATED_EFFECT (as supported, on market data, with the promotion gate approving that
+hypothesis's own challenger) — only the last is doctrine-eligible, and only through the research workflow.
 
-Holdout isolation: outcomes of a holdout evaluation are recorded (failures stay visible) but are marked
-``holdout_derived`` and can never seed a new hypothesis — holdout is for evaluation, not learning.
+Holdout isolation: holdout and promotion outcomes are recorded (failures stay visible) but are marked
+``holdout_derived`` and can never seed a hypothesis; their dataset identities never appear in Claude-facing views.
 """
 
 from __future__ import annotations
@@ -34,6 +31,7 @@ from enum import Enum
 
 from ati.core.canonical import sha256_hex
 from ati.core.errors import LifecycleError
+from ati.core.time import parse_utc
 from ati.ledger.journal import Journal, decode
 from ati.market.models import MARKET_EVIDENCE_STATUSES
 
@@ -50,29 +48,27 @@ class PatternClass(str, Enum):
     ONE_OFF = "ONE_OFF"                        # 1 outcome: never doctrine, never a rule
     POSSIBLE_PATTERN = "POSSIBLE_PATTERN"      # 2 independent outcomes
     RECURRING_PATTERN = "RECURRING_PATTERN"    # 3+ independent outcomes
-    SUPPORTED_EFFECT = "SUPPORTED_EFFECT"      # linked hypothesis passed development AND holdout
-    VALIDATED_EFFECT = "VALIDATED_EFFECT"      # as supported, on market data, with an approved promotion
+    SUPPORTED_PATTERN = "SUPPORTED_PATTERN"    # the linked hypothesis passed development AND holdout
+    VALIDATED_EFFECT = "VALIDATED_EFFECT"      # as supported, on market data, with the promotion gate approving
+                                               # *that hypothesis's* challenger — the only doctrine-eligible class
 
 
 class CandidateState(str, Enum):
+    """Status of the *learning candidate* itself. What happened to a hypothesis it produced is research status,
+    derived from the ResearchLog (``research_outcome``), never stored a second time here."""
     OBSERVED = "OBSERVED"
     ANALYZED = "ANALYZED"
     HYPOTHESIS_CANDIDATE = "HYPOTHESIS_CANDIDATE"
-    PREREGISTERED = "PREREGISTERED"
-    TESTING = "TESTING"
-    SUPPORTED = "SUPPORTED"
-    REJECTED = "REJECTED"
-    INCONCLUSIVE = "INCONCLUSIVE"
+    PROMOTED_TO_HYPOTHESIS = "PROMOTED_TO_HYPOTHESIS"
+    REJECTED = "REJECTED"                      # contradicted by later outcomes of the same kind
 
 
 _C = CandidateState
 TRANSITIONS: dict[CandidateState, frozenset[CandidateState]] = {
-    _C.OBSERVED: frozenset({_C.ANALYZED, _C.HYPOTHESIS_CANDIDATE, _C.PREREGISTERED}),
-    _C.ANALYZED: frozenset({_C.HYPOTHESIS_CANDIDATE, _C.PREREGISTERED}),
-    _C.HYPOTHESIS_CANDIDATE: frozenset({_C.PREREGISTERED}),
-    _C.PREREGISTERED: frozenset({_C.TESTING, _C.INCONCLUSIVE}),
-    _C.TESTING: frozenset({_C.SUPPORTED, _C.REJECTED, _C.INCONCLUSIVE}),
-    _C.SUPPORTED: frozenset(), _C.REJECTED: frozenset(), _C.INCONCLUSIVE: frozenset(),  # terminal, visible forever
+    _C.OBSERVED: frozenset({_C.ANALYZED, _C.PROMOTED_TO_HYPOTHESIS, _C.REJECTED}),
+    _C.ANALYZED: frozenset({_C.HYPOTHESIS_CANDIDATE, _C.PROMOTED_TO_HYPOTHESIS, _C.REJECTED}),
+    _C.HYPOTHESIS_CANDIDATE: frozenset({_C.PROMOTED_TO_HYPOTHESIS, _C.REJECTED}),
+    _C.PROMOTED_TO_HYPOTHESIS: frozenset(), _C.REJECTED: frozenset(),   # terminal, visible forever
 }
 
 
@@ -95,15 +91,18 @@ class OutcomeRecord:
 
 @dataclass
 class LearningCandidate:
-    candidate_id: str
+    candidate_id: str              # learning_id
     pattern: str                   # detector name
     key: dict                      # what the pattern is conditioned on
-    statement: str                 # deterministic template — never free text from Claude
+    statement: str                 # deterministic pattern label — never free text from Claude
     evidence: list[str]            # distinct outcome ids
     state: CandidateState
     holdout_derived: bool
     hypothesis_id: str | None = None
     history: list[tuple[str, str, str]] = field(default_factory=list)
+    interpretation: str = ""       # what *may* explain it (template, hedged) — never a fact
+    question: str = ""             # what should be tested
+    created_at: str = ""
 
     def quality(self, supported: bool = False, validated: bool = False) -> Quality:
         if validated:
@@ -301,6 +300,47 @@ _TEMPLATES = {
 }
 
 
+_INTERPRETATIONS = {
+    "REPEATED_LOSS": "The strategy's entries may be unreliable in the conditions that preceded these exits.",
+    "REGIME_FAILURE": "The strategy's edge may depend on market regime; regime {regime} may reduce its reliability.",
+    "EXECUTION_DEVIATION": "Realized execution may differ from what the risk model assumes for this strategy.",
+    "UNEXPECTED_COSTS": "Trading costs may be large relative to this strategy's typical gross move.",
+    "DRAWDOWN_CLUSTER": "Losses may be serially dependent (clustered), not independent draws.",
+    "STRATEGY_DEGRADATION": "The strategy's behaviour may have changed relative to its earlier trades.",
+    "RESEARCH_FAILURE": "Research at this stage may be asking questions the available data cannot answer.",
+    "HOLDOUT_FAILURE": "Development results may be overfitted; this is an evaluation observation only.",
+    "ROBUSTNESS_FAILURE": "Results may be fragile to this robustness perturbation.",
+    "PARAMETER_INSTABILITY": "Results may depend on narrowly chosen parameters.",
+    "PROMOTION_DENIED": "Candidates may not be meeting the promotion evidence standard (evaluation observation only).",
+    "DATA_FAILURE": "The data path may be unreliable for this failure kind.",
+    "CONTRACT_REJECTION": "Claude responses may be misunderstanding the action contract.",
+    "CONDITION_SHIFT": "A research assumption may no longer hold ({assumption}).",
+}
+_QUESTIONS = {
+    "REPEATED_LOSS": "Does a pre-registered filter on the entry condition improve out-of-sample expectancy versus the baseline?",
+    "REGIME_FAILURE": "Is the baseline's out-of-sample expectancy lower in regime {regime} than in other regimes (REGIME experiment)?",
+    "EXECUTION_DEVIATION": "Does the baseline's edge survive stressed execution costs or delay (EXECUTION experiment)?",
+    "UNEXPECTED_COSTS": "Does the baseline's edge survive a cost multiplier of 2 (EXECUTION experiment)?",
+    "DRAWDOWN_CLUSTER": "Does a different per-trade risk fraction change drawdown clustering in backtest (RISK experiment)?",
+    "STRATEGY_DEGRADATION": "Does the strategy's out-of-sample edge persist on the most recent unsealed data?",
+    "RESEARCH_FAILURE": "Is more data, or a different design, needed before this question is testable?",
+    "HOLDOUT_FAILURE": "Is the research process overfitting? (answerable only with new, unused holdout periods)",
+    "ROBUSTNESS_FAILURE": "Does a design that addresses this perturbation survive walk-forward and adversarial review?",
+    "PARAMETER_INSTABILITY": "Is there a parameter region that is stable under perturbation (SINGLE_VARIABLE experiment)?",
+    "PROMOTION_DENIED": "Which evidence requirement is most often missing? (process question; no candidate change)",
+    "DATA_FAILURE": "Can this data failure be prevented or detected earlier? (operational question)",
+    "CONTRACT_REJECTION": "Is the action contract documented clearly enough in the context? (operational question)",
+    "CONDITION_SHIFT": "Does the baseline's edge hold under the shifted condition ({assumption})?",
+}
+_TRADE_PATTERNS = frozenset({"REPEATED_LOSS", "REGIME_FAILURE", "EXECUTION_DEVIATION", "UNEXPECTED_COSTS",
+                             "DRAWDOWN_CLUSTER", "STRATEGY_DEGRADATION"})
+
+
+def _dataset_view(o: OutcomeRecord) -> str | None:
+    """Holdout identities stay in the learning journal (audit) but never appear in views that reach Claude."""
+    return "SEALED_HOLDOUT" if o.holdout_derived and o.source == "experiment" else o.dataset_id
+
+
 class LearningLedger:
     """Append-only learning ledger (existing Journal class, ``learning.jsonl``). Candidates and their state
     changes are replayed from it; a restart never loses or re-creates learning."""
@@ -309,6 +349,7 @@ class LearningLedger:
         self.journal = journal
         self.outcomes: dict[str, OutcomeRecord] = {}
         self.candidates: dict[str, LearningCandidate] = {}
+        self.memory_written: dict[str, str] = {}
         for e in journal.entries():
             p = decode(e.payload)
             if e.type == "outcome":
@@ -316,7 +357,8 @@ class LearningLedger:
             elif e.type == "candidate":
                 self.candidates[p["candidate_id"]] = LearningCandidate(
                     p["candidate_id"], p["pattern"], p["key"], p["statement"], [], CandidateState.OBSERVED,
-                    p["holdout_derived"])
+                    p["holdout_derived"], interpretation=p.get("interpretation", ""), question=p.get("question", ""),
+                    created_at=e.at)
             elif e.type == "candidate_evidence":
                 self.candidates[p["candidate_id"]].evidence.append(p["outcome_id"])
             elif e.type == "candidate_state":
@@ -328,6 +370,8 @@ class LearningLedger:
                 c.history.append((p["from"], p["to"], p["reason"]))
             elif e.type == "candidate_hypothesis":
                 self.candidates[p["candidate_id"]].hypothesis_id = p["hypothesis_id"]
+            elif e.type == "candidate_memory":
+                self.memory_written[p["candidate_id"]] = p["entry_id"]
 
     def _transition(self, c: LearningCandidate, new: CandidateState, reason: str) -> None:
         if new not in TRANSITIONS[c.state]:
@@ -352,22 +396,83 @@ class LearningLedger:
             if c is None:
                 keyd = dict(key)
                 holdout = pattern in ("HOLDOUT_FAILURE", "PROMOTION_DENIED")
-                statement = _TEMPLATES[pattern].format(**{k: keyd.get(k) for k in keyd})
-                self.journal.append("candidate", {"candidate_id": cid, "pattern": pattern, "key": keyd,
-                                                  "statement": statement, "holdout_derived": holdout})
+                fmt = {k: keyd.get(k) for k in keyd}
+                statement = _TEMPLATES[pattern].format(**fmt)
+                interpretation = _INTERPRETATIONS[pattern].format(**fmt)
+                question = _QUESTIONS[pattern].format(**fmt)
+                entry = self.journal.append("candidate", {"candidate_id": cid, "pattern": pattern, "key": keyd,
+                                                          "statement": statement, "holdout_derived": holdout,
+                                                          "interpretation": interpretation, "question": question})
                 c = self.candidates[cid] = LearningCandidate(cid, pattern, keyd, statement, [], CandidateState.OBSERVED,
-                                                             holdout)
+                                                             holdout, interpretation=interpretation, question=question,
+                                                             created_at=entry.at)
             for o in members:
                 if o.outcome_id not in c.evidence:          # a source event is evidence once
                     self.journal.append("candidate_evidence", {"candidate_id": cid, "outcome_id": o.outcome_id})
                     c.evidence.append(o.outcome_id)
             n = len(c.evidence)
+            contradiction = self._contradiction(c)
+            if contradiction and c.state in (_C.OBSERVED, _C.ANALYZED, _C.HYPOTHESIS_CANDIDATE):
+                self._transition(c, _C.REJECTED, contradiction)
+                continue
             if c.state is _C.OBSERVED and n >= 2:
-                self._transition(c, _C.ANALYZED, f"{n} independent outcomes: recurring pattern")
+                self._transition(c, _C.ANALYZED, f"{n} independent outcomes: possible pattern")
             if c.state is _C.ANALYZED and n >= 3 and not c.holdout_derived:
-                self._transition(c, _C.HYPOTHESIS_CANDIDATE, f"{n} independent outcomes: eligible for a hypothesis")
+                self._transition(c, _C.HYPOTHESIS_CANDIDATE, f"{n} independent outcomes: recurring pattern, eligible "
+                                                              "for a hypothesis")
         self._sync_research(system)
-        return {"new_outcomes": new_outcomes, "candidates": len(self.candidates)}
+        memory = self._remember(system)
+        return {"new_outcomes": new_outcomes, "candidates": len(self.candidates), "memory_entries": memory}
+
+    def _matching_trades(self, c: LearningCandidate) -> list[OutcomeRecord]:
+        k = c.key
+        out = []
+        for o in self.outcomes.values():
+            if o.source != "trade" or _pnl(o) is None or o.strategy != k.get("strategy"):
+                continue
+            if c.pattern == "REPEATED_LOSS" and (o.symbol, o.realized.get("exit_reason")) != (k.get("symbol"), k.get("exit_reason")):
+                continue
+            if c.pattern == "REGIME_FAILURE" and o.facts.get("regime") != k.get("regime"):
+                continue
+            out.append(o)
+        return out
+
+    def _contradiction(self, c: LearningCandidate) -> str | None:
+        """Contradictory evidence: once enough trades share the pattern's conditions, a loss pattern whose
+        matching trades are mostly profitable is REJECTED (kept visible), not silently dropped or kept."""
+        if c.pattern not in ("REPEATED_LOSS", "REGIME_FAILURE"):
+            return None
+        matching = self._matching_trades(c)
+        wins = sum(1 for o in matching if _pnl(o) > 0)
+        if len(matching) >= 4 and wins * 2 > len(matching):
+            return f"contradicted by later outcomes: {wins} of {len(matching)} matching trades were profitable"
+        return None
+
+    def _remember(self, system) -> int:
+        """Learning enters memory only through MemoryStore's own evidence gates, and only as HYPOTHESIS (never
+        doctrine): once per recurring (3+) trade pattern, citing the registered trade_review evidence. The entry
+        is deterministic (timestamp = the third outcome's), so a replay returns the same entry id."""
+        from ati.memory.store import MemoryEntry, MemoryKind
+
+        written = 0
+        for c in self.candidates.values():
+            if c.candidate_id in self.memory_written or c.pattern not in _TRADE_PATTERNS or len(c.evidence) < 3:
+                continue
+            outcomes = [self.outcomes[i] for i in c.evidence[:3]]
+            refs = [system.evidence.resolve(o.outcome_id) for o in outcomes if o.outcome_id in system.evidence]
+            if len(refs) < 3:
+                continue
+            created = max(max(r.available_at for r in refs), parse_utc(outcomes[-1].at))
+            tag = "" if system.data_status in MARKET_EVIDENCE_STATUSES else f"[{system.data_status.value}] "
+            statement = (f"{tag}RECURRING_PATTERN (not validated): {self.fact(c)} Interpretation (untested): "
+                         f"{c.interpretation} Question: {c.question}")[:1900]
+            entry = MemoryEntry(MemoryKind.HYPOTHESIS, statement, created, f"learning:{c.candidate_id}", tuple(refs),
+                                0.2, (), tuple(sorted({o.strategy for o in outcomes if o.strategy})), "")
+            entry_id = system.memory.add(entry)
+            self.journal.append("candidate_memory", {"candidate_id": c.candidate_id, "entry_id": entry_id})
+            self.memory_written[c.candidate_id] = entry_id
+            written += 1
+        return written
 
     def link_hypothesis(self, candidate_id: str, hypothesis_id: str) -> None:
         c = self.candidates[candidate_id]
@@ -378,53 +483,128 @@ class LearningLedger:
             c.hypothesis_id = hypothesis_id
 
     def _sync_research(self, system) -> None:
-        """Advance linked candidates from the research journal's facts — never from Claude's claims."""
+        """A linked candidate becomes PROMOTED_TO_HYPOTHESIS once the ResearchLog holds the pre-registration —
+        a fact, never Claude's claim. What the hypothesis then yields is research status (see research_outcome)."""
         from ati.research.hypothesis import ResearchLog
 
         log = ResearchLog(system.research_journal)
-        market = system.data_status in MARKET_EVIDENCE_STATUSES
         for c in self.candidates.values():
             h = c.hypothesis_id
-            if h is None or c.state in (_C.SUPPORTED, _C.REJECTED, _C.INCONCLUSIVE):
+            if h is None or c.state in (_C.PROMOTED_TO_HYPOTHESIS, _C.REJECTED):
                 continue
-            dev, hold = log.status(h), log.status(f"{h}:holdout")
-            if dev != "UNKNOWN" and c.state in (_C.OBSERVED, _C.ANALYZED, _C.HYPOTHESIS_CANDIDATE):
-                self._transition(c, _C.PREREGISTERED, f"hypothesis {h} pre-registered")
-            if dev.startswith("TESTED:") and c.state is _C.PREREGISTERED:
-                self._transition(c, _C.TESTING, f"{h} tested in development")
-            if c.state is not _C.TESTING:
-                continue
-            diagnostic = any(e["hypothesis_id"] == h and str(e["stage"]).startswith("diagnostic:") for e in log.experiments)
-            if diagnostic and dev != "TESTED:FAIL":
-                self._transition(c, _C.INCONCLUSIVE, f"{h}: development-only diagnostic {dev}; development evidence "
-                                                     "alone cannot support an effect")
-            elif dev == "TESTED:FAIL" or hold == "TESTED:FAIL":
-                self._transition(c, _C.REJECTED, f"{h}: development {dev}, holdout {hold}")
-            elif dev == "TESTED:PASS" and hold == "TESTED:PASS":
-                self._transition(c, _C.SUPPORTED, f"{h}: passed development and holdout "
-                                 f"({'market' if market else 'non-market'} data)")
-            elif hold.startswith("TESTED:") or dev == "TESTED:INSUFFICIENT_EVIDENCE":
-                self._transition(c, _C.INCONCLUSIVE, f"{h}: development {dev}, holdout {hold}")
+            if log.status(h) != "UNKNOWN":
+                self._transition(c, _C.PROMOTED_TO_HYPOTHESIS, f"hypothesis {h} pre-registered")
+
+    def research_outcome(self, c: LearningCandidate, system) -> str:
+        """NONE | PREREGISTERED | TESTING | SUPPORTED | REJECTED | INCONCLUSIVE — derived from the ResearchLog."""
+        from ati.research.hypothesis import ResearchLog
+
+        if c.hypothesis_id is None:
+            return "NONE"
+        log = ResearchLog(system.research_journal)
+        h = c.hypothesis_id
+        dev, hold = log.status(h), log.status(f"{h}:holdout")
+        if dev == "UNKNOWN":
+            return "NONE"
+        if dev == "PREREGISTERED":
+            return "PREREGISTERED"
+        diagnostic = any(e["hypothesis_id"] == h and str(e["stage"]).startswith("diagnostic:") for e in log.experiments)
+        if dev == "TESTED:FAIL" or hold == "TESTED:FAIL":
+            return "REJECTED"
+        if diagnostic:
+            return "INCONCLUSIVE"    # development-only evidence cannot support an effect
+        if dev == "TESTED:PASS" and hold == "TESTED:PASS":
+            return "SUPPORTED"
+        if hold.startswith("TESTED:") or dev == "TESTED:INSUFFICIENT_EVIDENCE":
+            return "INCONCLUSIVE"
+        return "TESTING"
+
+    def _validated(self, c: LearningCandidate, system) -> bool:
+        """VALIDATED requires: supported research outcome, market-category data, and an approved promotion of
+        the challenger *this hypothesis's holdout pre-registration locked* — not any promotion in the journal."""
+        from ati.research.hypothesis import ResearchLog
+
+        if system.data_status not in MARKET_EVIDENCE_STATUSES or self.research_outcome(c, system) != "SUPPORTED":
+            return False
+        log = ResearchLog(system.research_journal)
+        challenger = log.get(f"{c.hypothesis_id}:holdout").strategy_hash
+        return any(decode(e.payload)["record"]["approved"] and e.payload["record"]["challenger_hash"] == challenger
+                   for e in system.research_journal.entries("promotion_decision"))
 
     # --- views -----------------------------------------------------------------------------------------------
     def quality(self, c: LearningCandidate, system) -> Quality:
-        supported = c.state is _C.SUPPORTED
-        validated = supported and system.data_status in MARKET_EVIDENCE_STATUSES and c.hypothesis_id is not None and any(
-            decode(e.payload)["record"]["approved"] for e in system.research_journal.entries("promotion_decision"))
-        return c.quality(supported, validated)
+        supported = self.research_outcome(c, system) == "SUPPORTED"
+        return c.quality(supported, supported and self._validated(c, system))
 
     def pattern_class(self, c: LearningCandidate, system) -> PatternClass:
         q = self.quality(c, system)
         if q is Quality.VALIDATED_EVIDENCE:
             return PatternClass.VALIDATED_EFFECT
         if q is Quality.SUPPORTED_EVIDENCE:
-            return PatternClass.SUPPORTED_EFFECT
+            return PatternClass.SUPPORTED_PATTERN
         n = len(c.evidence)
         return PatternClass.ONE_OFF if n <= 1 else PatternClass.POSSIBLE_PATTERN if n == 2 else PatternClass.RECURRING_PATTERN
 
+    def fact(self, c: LearningCandidate) -> str:
+        """FACT: what objectively happened, computed from the recorded outcomes (no interpretation)."""
+        outs = [self.outcomes[i] for i in c.evidence if i in self.outcomes]
+        n = len(outs)
+        if c.pattern in _TRADE_PATTERNS:
+            pnls = [_pnl(o) for o in outs if _pnl(o) is not None]
+            lost = sum(1 for p in pnls if p < 0)
+            cat = outs[0].data_category if outs else "UNKNOWN"
+            key = ", ".join(f"{k}={v}" for k, v in sorted(c.key.items()))
+            return (f"{n} {cat} paper trade outcome(s) matched [{key}]: {lost} lost, {len(pnls) - lost} did not; "
+                    f"net P&L {sum(pnls, Decimal(0)):.2f}.")
+        if c.pattern in ("RESEARCH_FAILURE", "HOLDOUT_FAILURE"):
+            return f"{n} experiment(s) at stage {c.key.get('stage')} ended {c.key.get('verdict')}."
+        if c.pattern in ("ROBUSTNESS_FAILURE", "PARAMETER_INSTABILITY"):
+            return f"{n} adversarial review(s) failed the check: {c.key.get('question')}"
+        return f"{n} recorded {c.pattern.lower()} event(s): " + ", ".join(f"{k}={v}" for k, v in sorted(c.key.items()))
+
+    def evidence_references(self, c: LearningCandidate, system) -> list[dict]:
+        refs = []
+        for i in c.evidence:
+            o = self.outcomes.get(i)
+            if o is None:
+                continue
+            refs.append({"outcome_id": i, "source_type": o.source, "registered_evidence": i if i in system.evidence else None,
+                         "decision_id": o.facts.get("trade_id"), "hypothesis_id": o.facts.get("hypothesis_id"),
+                         "dataset_id": _dataset_view(o), "at": o.at})
+        return refs
+
+    def record(self, c: LearningCandidate, system) -> dict:
+        """The learning-candidate contract: identity, provenance, FACT / INTERPRETATION / QUESTION kept apart."""
+        first = self.outcomes.get(c.evidence[0]) if c.evidence else None
+        return {
+            "learning_id": c.candidate_id,
+            "source_event": {"source_type": first.source if first else None, "source_id": first.outcome_id if first else None},
+            "provenance": {"source_type": first.source if first else None, "source_id": first.outcome_id if first else None,
+                           "strategy_fingerprint": first.strategy if first else None,
+                           "dataset_identity": _dataset_view(first) if first else None,
+                           "data_category": first.data_category if first else system.data_status.value,
+                           "created_at": c.created_at},
+            "pattern": c.pattern,
+            "FACT": self.fact(c),
+            "INTERPRETATION": c.interpretation,
+            "PROPOSED_QUESTION": c.question,
+            "evidence_references": self.evidence_references(c, system),
+            "confidence_class": self.quality(c, system).value,
+            "classification": self.pattern_class(c, system).value,
+            "status": c.state.value,
+            "research_eligible": c.research_eligible,
+            "holdout_derived": c.holdout_derived,
+            "hypothesis": {"hypothesis_id": c.hypothesis_id, "research_outcome": self.research_outcome(c, system)},
+            "memory_entry": self.memory_written.get(c.candidate_id),
+        }
+
     def summary(self, system, limit: int = 8) -> list[dict]:
         ordered = sorted(self.candidates.values(), key=lambda c: (-len(c.evidence), c.candidate_id))[:limit]
-        return [{"candidate_id": c.candidate_id, "pattern": c.pattern, "statement": c.statement, "state": c.state.value,
-                 "evidence_count": len(c.evidence), "quality": self.quality(c, system).value,
-                 "class": self.pattern_class(c, system).value, "research_eligible": c.research_eligible,
-                 "holdout_derived": c.holdout_derived, "hypothesis_id": c.hypothesis_id} for c in ordered]
+        out = []
+        for c in ordered:
+            r = self.record(c, system)
+            r["evidence_references"] = [e["outcome_id"] for e in r["evidence_references"]][:6]
+            out.append(r | {"candidate_id": c.candidate_id, "state": c.state.value, "evidence_count": len(c.evidence),
+                            "quality": r["confidence_class"], "class": r["classification"],
+                            "hypothesis_id": c.hypothesis_id, "statement": c.statement})
+        return out

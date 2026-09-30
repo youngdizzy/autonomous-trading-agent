@@ -101,7 +101,8 @@ def run_research_cycle(system, full: Dataset, boundary: datetime, *, hypothesis_
                        base: StrategyDefinition, grid: list[dict], criteria: tuple[Criterion, ...],
                        train_bars: int, test_bars: int, config: BacktestConfig = BacktestConfig(),
                        adversarial_policy: AdversarialPolicy = AdversarialPolicy(),
-                       promotion_policy: PromotionPolicy = PromotionPolicy(), min_candles: int = 0) -> CycleResult:
+                       promotion_policy: PromotionPolicy = PromotionPolicy(), min_candles: int = 0,
+                       observation_refs: tuple[str, ...] = ()) -> CycleResult:
     s = system
     now = s.clock.now()
     journal = s.research_journal
@@ -128,7 +129,9 @@ def run_research_cycle(system, full: Dataset, boundary: datetime, *, hypothesis_
     s.evidence.register("dataset", dev.dataset_id, dev.identity.temporal_boundary, "development partition",
                         dataset_id=dev.dataset_id)
 
-    prereg = PreRegistration(hypothesis_id, statement, (), base.key, base.definition_hash, dev.dataset_id, criteria,
+    # observation_refs: what motivated the hypothesis (e.g. learning evidence) — locked into the pre-registration.
+    prereg = PreRegistration(hypothesis_id, statement, tuple(observation_refs), base.key, base.definition_hash,
+                             dev.dataset_id, criteria,
                              adversarial_policy.min_oos_trades, now)
     log.preregister(prereg)
 
@@ -166,7 +169,8 @@ def run_research_cycle(system, full: Dataset, boundary: datetime, *, hypothesis_
                         dataset_id=adv.dataset_id, strategy=challenger.definition_hash)
     journal.append("adversarial_report", {"report": adv, "evidence_hash": adv.evidence_hash})
 
-    hold_prereg = PreRegistration(hypothesis_id + ":holdout", statement, (), challenger.key, challenger.definition_hash,
+    hold_prereg = PreRegistration(hypothesis_id + ":holdout", statement, tuple(observation_refs), challenger.key,
+                                  challenger.definition_hash,
                                   dev.dataset_id, criteria, promotion_policy.min_holdout_trades, now)
     log.preregister(hold_prereg)
     hold = vault.evaluate(challenger, hold_prereg, config)

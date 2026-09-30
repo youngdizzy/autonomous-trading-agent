@@ -128,8 +128,8 @@ class TestStructural:
         assert not list(s.research_journal.entries("candidate_lineage"))
         assert not list(s.research_journal.entries("holdout_access"))
         comp = [e.payload for e in s.research_journal.entries("experiment_comparison")]
-        assert len(comp) == 1 and comp[0]["candidate_strategy"].startswith("buy_and_hold")
-        assert comp[0]["baseline_strategy"] == "trend@v1"
+        assert len(comp) == 1 and comp[0]["candidate_strategy_id"].startswith("buy_and_hold")
+        assert comp[0]["baseline_strategy_id"] == "trend@v1"
 
     @pytest.mark.parametrize("structure,needle", [({"kind": "ma_crossover", "params": {"fast": 3}}, "different strategy logic"),
                                                   ({"kind": "martingale", "params": {"x": 2}}, "only registered strategy logic")])
@@ -326,12 +326,12 @@ class TestEndToEndPaperCycle:
         def claude(prompt):
             p = packet(prompt)
             if p["request_id"] not in answered:
-                eligible = [c for c in p["learning_candidates"] if c["research_eligible"]]
+                eligible = [c for c in p["RELEVANT_LEARNINGS"]["learning_candidates"] if c["research_eligible"]]
                 if mode["research"] is None and eligible and "RESEARCH_REQUEST" in p["allowed_actions"]:
                     mode["research"] = eligible[0]["candidate_id"]
                     action, payload = "RESEARCH_REQUEST", designed("H-e2e-1", learning_candidate_id=mode["research"],
                                                                    statement="Faster entries reduce repeated losses")
-                elif p["strategy"]["entry_signals"] and "TRADE_PROPOSAL" in p["allowed_actions"]:
+                elif p["STRATEGY"]["entry_signals"] and "TRADE_PROPOSAL" in p["allowed_actions"]:
                     action, payload = "TRADE_PROPOSAL", trade_payload(p)
                 else:
                     action, payload = "NO_TRADE", {}

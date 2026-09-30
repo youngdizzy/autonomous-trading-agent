@@ -203,6 +203,11 @@ def company(cmd: str, state_dir: Path, data: str, ack: str | None, max_cycles: i
         except (PermissionError, _AtiError) as exc:
             print(f"resume refused: {exc}")
             return 6
+    elif cmd == "report":
+        from ati.company.intelligence import report as intelligence_report
+
+        print(json.dumps(intelligence_report(cp), indent=2, default=str))
+        return 0
     elif cmd == "readiness":
         from ati.company.readiness import report
 
@@ -257,7 +262,7 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("research-real", help="run the pre-declared REAL research protocol once")
     r.add_argument("--state-dir", type=Path, required=True)
     c = sub.add_parser("company", help="company control plane: one bounded cycle, status, pause, resume")
-    c.add_argument("action", choices=["cycle", "run", "status", "readiness", "pause", "resume"])
+    c.add_argument("action", choices=["cycle", "run", "status", "readiness", "report", "pause", "resume"])
     c.add_argument("--state-dir", type=Path, required=True)
     c.add_argument("--data", choices=["mock", "kraken"], required=True)
     c.add_argument("--ack", default=None, help="operator acknowledgement phrase (resume only)")

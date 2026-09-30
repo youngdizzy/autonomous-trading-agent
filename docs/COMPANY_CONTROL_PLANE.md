@@ -119,3 +119,36 @@ The cycle ends with a mandatory **LEARN** step (journaled once per cycle, idempo
 
 The context package also carries the autonomy level, the objective contract, the research budget, the scorecard,
 learning candidates, failed experiments and validated findings. These inform Claude but authorize nothing.
+
+## Phase 2 — learning organisation
+
+- **Learning candidate contract**:
+  - `learning_id` plus provenance: source type and id, strategy fingerprint, dataset identity, data category and
+    creation time.
+  - A **FACT** computed from the recorded outcomes, a hedged **INTERPRETATION** ("may"), and a
+    **PROPOSED_QUESTION**. These are never collapsed into one statement.
+  - Evidence references, a confidence class, a classification and a status.
+- **Status and classification**:
+  - Status: OBSERVED → ANALYZED → HYPOTHESIS_CANDIDATE → PROMOTED_TO_HYPOTHESIS. A candidate becomes REJECTED
+    when later matching outcomes contradict it. Terminal states stay visible.
+  - What the hypothesis then yields is research status, derived from the ResearchLog.
+  - Classification: ONE_OFF → POSSIBLE_PATTERN → RECURRING_PATTERN → SUPPORTED_PATTERN → VALIDATED_EFFECT.
+    VALIDATED_EFFECT requires the promotion gate to have approved *that hypothesis's own* challenger, on market
+    data.
+- **Memory**: LEARN writes only non-doctrinal HYPOTHESIS entries, through `MemoryStore.add` and its evidence
+  gates, once per recurring (3+) trade pattern. Entries are deterministic, so a replay returns the same entry.
+  Doctrine remains reachable only through the research workflow's validated-finding path.
+- **Hypothesis bridge**: a RESEARCH_REQUEST citing a learning candidate must carry an experiment design. The
+  control plane locks `learning:<id>` and the candidate's registered evidence into the existing
+  pre-registration's `observation_refs`.
+- **Context sections**: COMPANY_STATE, DATA_HEALTH, STRATEGY, RISK_STATE, RECENT_OUTCOMES, RELEVANT_LEARNINGS,
+  ACTIVE_HYPOTHESES, RECENT_EXPERIMENTS, FAILED_EXPERIMENTS, REJECTED_HYPOTHESES, VALIDATED_FINDINGS,
+  CHALLENGERS, SYSTEM_HEALTH, RESEARCH_BUDGET and RESEARCH_PROTOCOL, plus `as_of`. Every learning or memory item
+  carries an explicit `evidence_level`. Holdout dataset identities never appear; they show as `SEALED_HOLDOUT`.
+- **Candidates**: `candidate_id`, `promotion_id`, an immutable lineage record with the `attempts` made before
+  it, and a champion/challenger evidence profile (`factory.review`). Every dimension is reported separately;
+  volatility is NOT_AVAILABLE.
+- **Recovery**: a restart persists any missing lineage. A run interrupted after its promotion decision is
+  reported as `requires_review`; recovery never applies or reverses a promotion.
+- **Report**: `ati company report` is the read-only daily intelligence report. Every figure carries its data
+  label, and profitability stays INSUFFICIENT_EVIDENCE until there are ≥ 30 market-data trades.

@@ -222,9 +222,12 @@ class TestSingleVariableExperiment:
         assert comp[0]["dev_dataset_id"] == wf_rows[0]["dataset_id"]            # development partition only
         assert "promot" in comp[0]["note"] and comp[0]["baseline_replaced"] is False
         for side in ("baseline", "candidate"):
-            assert {f"{side}_strategy", f"{side}_fingerprint", f"{side}_dataset", f"{side}_results"} <= set(comp[0])
-        assert comp[0]["baseline_strategy"] == "trend@v1" and comp[0]["candidate_evidence"] == wf_rows[0]["evidence_hash"]
-        assert comp[0]["baseline_dataset"] == comp[0]["candidate_dataset"] == wf_rows[0]["dataset_id"]
+            assert {f"{side}_strategy_id", f"{side}_fingerprint", f"{side}_dataset_identity", f"{side}_result"} <= set(comp[0])
+        assert comp[0]["baseline_strategy_id"] == "trend@v1" and comp[0]["candidate_evidence"] == wf_rows[0]["evidence_hash"]
+        assert comp[0]["baseline_dataset_identity"] == comp[0]["candidate_dataset_identity"] == wf_rows[0]["dataset_id"]
+        assert comp[0]["candidate_fingerprint"] and comp[0]["candidate_fingerprint"] != comp[0]["baseline_fingerprint"]
+        assert comp[0]["attempts"]["root_hypotheses_tested_before"] == 0
+        assert design["changed_variables"] == [{"variable": "fast", "baseline": 10, "candidate": 20}]
         assert "wfo_stability" in comp[0]["dimensions"] and comp[0]["not_measured"]
         assert out.detail["comparison"]["conclusion"] == comp[0]["conclusion"]
         # baseline never silently replaced: trend@v1 keeps the baseline params; the candidate is a child version
@@ -241,7 +244,7 @@ class TestSingleVariableExperiment:
         assert lineage[0]["provenance"]["data_status"] == "MOCK"
         from ati.company import factory
         trail = factory.stages(s, children[0].definition_hash)
-        assert trail["stages"]["CANDIDATE_GENERATED"] == children[0].key and trail["stages"]["WFO"] == "PASS"
+        assert trail["stages"]["CANDIDATE_GENERATED"] == children[0].key and trail["stages"]["WALK_FORWARD"] == "PASS"
         assert trail["stages"]["ADVERSARIAL"] != "NOT_REACHED" and trail["stages"]["PROMOTION_REVIEW"] != "NOT_REACHED"
         assert trail["stages"]["VALIDATION"] == ("APPROVED" if out.detail["promotion_approved"] else "DENIED")
         # the LEARN stage ran for this cycle and learned from the experiment outcome(s)
@@ -317,22 +320,30 @@ class TestLearning:
         cp, s, clock = rejected_cycles(tmp_path, 1)
         c = next(iter(cp.learning.candidates.values()))
         with pytest.raises(LifecycleError):
-            cp.learning._transition(c, CandidateState.SUPPORTED, "skip the evidence")
+            cp.learning._transition(c, CandidateState.HYPOTHESIS_CANDIDATE, "skip the evidence")
         j = cp.learning.journal
-        j.append("candidate_state", {"candidate_id": c.candidate_id, "from": "OBSERVED", "to": "SUPPORTED", "reason": "x"})
+        j.append("candidate_state", {"candidate_id": c.candidate_id, "from": "OBSERVED", "to": "HYPOTHESIS_CANDIDATE",
+                                     "reason": "x"})
         with pytest.raises(LifecycleError):
             LearningLedger(Journal(j.path, kind="learning", clock=s.clock, guard=s.guard, attrs=j.attrs))
 
     def test_terminal_states_are_permanent_and_visible(self):
-        for terminal in (CandidateState.SUPPORTED, CandidateState.REJECTED, CandidateState.INCONCLUSIVE):
+        for terminal in (CandidateState.PROMOTED_TO_HYPOTHESIS, CandidateState.REJECTED):
             assert learning.TRANSITIONS[terminal] == frozenset()
 
     def test_learning_has_no_path_to_authority(self):
         for mod in (learning, objectives, budget, scorecard, autonomy):
             src = inspect.getsource(mod)
             for forbidden in ("ati.risk", "ati.execution", "strategies.transition", "strategies.register",
-                              "apply_promotion", ".derive(", "memory.add", "LIVE_TRADING =", "limits."):
+                              "apply_promotion", ".derive(", "LIVE_TRADING =", "limits."):
                 assert forbidden not in src or (mod is scorecard and forbidden == "limits."), (mod.__name__, forbidden)
+            # memory: only learning writes, only through MemoryStore.add (all evidence gates), only HYPOTHESIS kind
+            if mod is learning:
+                import re
+                assert src.count("memory.add(") == 1
+                assert set(re.findall(r"MemoryKind\.([A-Z_]+)", src)) == {"HYPOTHESIS"}
+            else:
+                assert "memory.add" not in src, mod.__name__
 
 
 # --- data conflict --------------------------------------------------------------------------------------------------
@@ -424,8 +435,10 @@ class TestScorecardAndContext:
         cp, s, _ = plane(tmp_path / "st", script={"company": reply("NO_TRADE")})
         cp.run_cycle()
         issued = next(e.payload["data"] for e in cp.journal.entries("cycle_step") if e.payload["step"] == "request_issued")
-        assert set(issued["context_categories"]) >= {"research_budget", "scorecard", "learning_candidates", "objective",
-                                                     "autonomy", "failed_experiments", "validated_findings"}
+        assert set(issued["context_categories"]) >= {
+            "COMPANY_STATE", "DATA_HEALTH", "STRATEGY", "RISK_STATE", "RECENT_OUTCOMES", "RELEVANT_LEARNINGS",
+            "ACTIVE_HYPOTHESES", "RECENT_EXPERIMENTS", "FAILED_EXPERIMENTS", "VALIDATED_FINDINGS", "CHALLENGERS",
+            "SYSTEM_HEALTH", "RESEARCH_BUDGET", "REJECTED_HYPOTHESES", "as_of"}
         assert cp.state is CompanyState.COMPLETED
 
     def test_every_cycle_learns_once(self, tmp_path):
@@ -449,16 +462,15 @@ class TestLearningToResearch:
         assert out.status == "COMPLETED", out.detail
         c = cp.learning.candidates[c.candidate_id]
         assert c.hypothesis_id == "H-lc-1"
-        # state advanced only from ResearchLog facts, through every intermediate state, to a terminal state
+        # the learning status advanced only from ResearchLog facts; the research outcome is derived, not stored twice
         path = [h[1] for h in c.history]
-        assert path[:3] == ["ANALYZED", "HYPOTHESIS_CANDIDATE", "PREREGISTERED"] and "TESTING" in path
+        assert path == ["ANALYZED", "HYPOTHESIS_CANDIDATE", "PROMOTED_TO_HYPOTHESIS"]
         log = ResearchLog(s.research_journal)
-        expected = {"TESTED:FAIL": "REJECTED"}.get(log.status("H-lc-1"), None) or \
-            {"TESTED:FAIL": "REJECTED"}.get(log.status("H-lc-1:holdout"))
-        if expected:
-            assert c.state.value == expected
+        outcome = cp.learning.research_outcome(c, s)
+        if "TESTED:FAIL" in (log.status("H-lc-1"), log.status("H-lc-1:holdout")):
+            assert outcome == "REJECTED"
         else:
-            assert c.state.value in ("SUPPORTED", "INCONCLUSIVE")
+            assert outcome in ("SUPPORTED", "INCONCLUSIVE")
         # MOCK data can never reach VALIDATED_EVIDENCE, whatever the outcome
         assert cp.learning.quality(c, s) is not Quality.VALIDATED_EVIDENCE
         # a second request citing a now-terminal candidate is refused

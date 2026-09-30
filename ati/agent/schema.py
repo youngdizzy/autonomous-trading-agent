@@ -492,6 +492,8 @@ def _experiment(e, base: dict) -> ExperimentSpec:
             raise SchemaViolation(f"INTERACTION changes at least two parameters (changed: {changed})")
         if sorted(iv) != changed:
             raise SchemaViolation(f"independent_variables {sorted(iv)} must name exactly the changed parameters {changed}")
+        if kind == "INTERACTION" and len(texts["design_rationale"]) < 40:
+            raise SchemaViolation("INTERACTION design_rationale must explain why the variables must change together")
         params = tuple(sorted(cp.items()))
     elif allowed_extra == "structure":
         st = e["structure"]

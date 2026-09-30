@@ -52,14 +52,15 @@ def reply(action, payload=None, reason="concise reason", **envelope):
 
 
 def trade_payload(p, **over):
-    signals = p["strategy"]["entry_signals"]
+    signals = p["STRATEGY"]["entry_signals"]
     if signals:
         sym, sig = next(iter(signals.items()))
         last = Decimal(sig["last_close"])
     else:  # no entry signal right now: propose anyway (the control plane must refuse it)
         sym = "BTC/USD"
-        last = Decimal(p["market"][sym]["last_price"]) if p["market"] else Decimal("30000")
-    return {"symbol": sym, "side": "BUY", "strategy_key": p["strategy"]["champion"], "entry_price": str(last),
+        market = p["DATA_HEALTH"]["market"]
+        last = Decimal(market[sym]["last_price"]) if market else Decimal("30000")
+    return {"symbol": sym, "side": "BUY", "strategy_key": p["STRATEGY"]["champion"], "entry_price": str(last),
             "stop_price": str(last * Decimal("0.97")), "thesis": "[MOCK] follow the champion's entry signal",
             "invalidation_condition": "close below the stop", "confidence": 0.5} | over
 
