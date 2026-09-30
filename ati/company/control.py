@@ -5,7 +5,7 @@ One ``run_cycle()`` call is one bounded company cycle:
     START → RECOVER → deterministic duties (data refresh, reconciliation, risk state, stop/signal exits)
           → HEALTH_CHECK → READ_STATE / PREPARE_CONTEXT → CLAUDE_ACTION (file exchange)
           → VALIDATE_ACTION (closed schema + health gate) → EXECUTE_ALLOWED_ACTION (existing systems only)
-          → RECORD_RESULT → FINALIZE
+          → RECORD_RESULT → LEARN (deterministic outcome learning, ati.company.learning) → FINALIZE
 
 Authority stays where it was: data truth in market/archive, research integrity in ResearchLog and the
 research workflow, sizing and approval in the RiskEngine, orders in the ExecutionEngine, accounting in
@@ -33,16 +33,22 @@ from ati.agent.reasoning import ReasoningBudgetExceeded, ReasoningPending
 from ati.agent.roles import COMPANY, build_prompt
 from ati.agent.schema import (COMPANY_ACTIONS, CompanyAction, CompanyContext, ValidationContext,
                               parse_company_response)
+from ati.company import autonomy, budget, objectives, scorecard
 from ati.company.health import HealthReport, Status, assess
+from ati.company.learning import LearningLedger
 from ati.core.canonical import sha256_hex, sha256_text
 from ati.core.errors import AtiError, CompanyStateError, SchemaViolation
 from ati.core.types import Side
-from ati.data.dataset import Dataset
+from ati.data.dataset import Dataset, Partition
 from ati.decision.records import make_decision_id
 from ati.ledger.journal import Journal, decode
+from ati.market.conflict import ConflictRegister
+from ati.memory.store import MemoryKind
 from ati.research import protocol as P
 from ati.research.adversarial import AdversarialPolicy
 from ati.research.hypothesis import Criterion, ResearchLog
+from ati.research.metrics import Metrics
+from ati.research.walkforward import walk_forward
 from ati.research.workflow import run_research_cycle
 from ati.validation.promotion import PromotionPolicy
 
@@ -68,6 +74,8 @@ TRANSITIONS: dict[CompanyState, frozenset[CompanyState]] = {
 RESUME_ACK = "OPERATOR: company state reviewed; resume autonomous activity"
 _EPOCH = datetime(2024, 1, 1, tzinfo=timezone.utc)
 PROTOCOLS = {P.PROTOCOL_ID: P.base_definition(_EPOCH).key}
+PROTOCOL_PARAMS = {P.PROTOCOL_ID: dict(P.BASE_PARAMS)}
+EXECUTABLE_EXPERIMENTS = frozenset({"SINGLE_VARIABLE", "INTERACTION"})   # others: executor NOT IMPLEMENTED
 
 
 @dataclass
@@ -92,11 +100,17 @@ class CompanyControlPlane:
     def __init__(self, system, *, loop: AutonomousLoop | None = None,
                  research_policies: tuple[AdversarialPolicy, PromotionPolicy] | None = None):
         s = system
+        self.autonomy = autonomy.require(autonomy.Autonomy.PAPER_AUTONOMY)   # the ceiling is code, not config
         self.s = s
         self.loop = loop or AutonomousLoop(s)
         self.research_policies = research_policies or (AdversarialPolicy(), PromotionPolicy())
         self.journal = Journal(s.state_dir / "company.jsonl", kind="company", clock=s.clock, guard=s.guard,
                                attrs={"mode": s.mode.value, "data_status": s.data_status.value})
+        attrs = {"mode": s.mode.value, "data_status": s.data_status.value}
+        self.learning = LearningLedger(Journal(s.state_dir / "learning.jsonl", kind="learning", clock=s.clock,
+                                               guard=s.guard, attrs=attrs))
+        self.conflicts = ConflictRegister(Journal(s.state_dir / "conflicts.jsonl", kind="conflicts", clock=s.clock,
+                                                  guard=s.guard, attrs=attrs))
         self.state = CompanyState.IDLE
         self.paused = False
         self.pause_epoch = 0
@@ -182,7 +196,7 @@ class CompanyControlPlane:
                 cand = self.loop.manage_position(report, symbol, ds, marks, champion)
                 if cand is not None:
                     candidates[symbol] = cand
-        health = assess(s, self.loop, datasets, self.journal, self.paused)
+        health = assess(s, self.loop, datasets, self.journal, self.paused, self.conflicts)
         fingerprint = self._fingerprint(datasets, health)
 
         if self.running is not None:                                   # RECOVER
@@ -346,15 +360,43 @@ class CompanyControlPlane:
     def _research(self, cyc, action: CompanyAction):
         s = self.s
         spec = action.research
+        exp = spec.experiment
         log = self._research_log()
         if log is None:
             return "BLOCKED", {"reason": "research journal cannot be reconstructed (research FAIL)"}
+        base = P.base_definition(s.clock.now())
         if log.status(spec.hypothesis_id) != "UNKNOWN":
             if "research_invoked" in cyc.steps:  # this cycle already ran it before a crash: report, never rerun
-                return "COMPLETED", {"hypothesis_id": spec.hypothesis_id, "research_status": log.status(spec.hypothesis_id),
-                                     "recovered": True}
+                detail = {"hypothesis_id": spec.hypothesis_id, "research_status": log.status(spec.hypothesis_id),
+                          "recovered": True}
+                if exp is not None and exp.candidate_params is not None:
+                    detail["comparison"] = self._compare(spec, base, log)
+                self._link(spec)
+                return "COMPLETED", detail
             return "BLOCKED", {"reason": f"{spec.hypothesis_id} is already registered ({log.status(spec.hypothesis_id)}); "
                                          "criteria are locked — a new question needs a new hypothesis id"}
+        if exp is not None and exp.type not in EXECUTABLE_EXPERIMENTS:
+            return "BLOCKED", {"reason": f"{exp.type} experiment executor is NOT IMPLEMENTED; nothing was run or "
+                                         "approximated"}
+        lc = spec.learning_candidate_id
+        if lc is not None:
+            cand = self.learning.candidates.get(lc)
+            if cand is None:
+                return "BLOCKED", {"reason": f"unknown learning candidate {lc}"}
+            if cand.holdout_derived:
+                return "BLOCKED", {"reason": f"{lc} is derived from holdout/promotion outcomes: holdout results never "
+                                             "motivate new hypotheses"}
+            if not cand.research_eligible:
+                return "BLOCKED", {"reason": f"{lc} is {cand.state.value} with {len(cand.evidence)} outcome(s): "
+                                             "not eligible for a hypothesis"}
+        registered = self._registered(base)
+        grid = [dict(exp.candidate_params)] if exp is not None and exp.candidate_params is not None else P.GRID
+        new_variant = any(self._registered_with(base, g) is None for g in grid if g != dict(P.BASE_PARAMS))
+        if "research_invoked" not in cyc.steps:
+            u = budget.usage(s, self.journal, s.clock.now(), registered.definition_hash if registered else None)
+            over = budget.check(u, new_variant)
+            if over:
+                return "BLOCKED", {"reason": "research budget: " + "; ".join(over), "budget_policy": u["policy_hash"]}
         criteria = list(P.CRITERIA)  # the protocol's floor is always included: requests can only add criteria
         for metric, op, threshold in spec.success_criteria:
             c = Criterion(metric, op, threshold)
@@ -366,18 +408,99 @@ class CompanyControlPlane:
         if not series:
             return "COMPLETED", {"hypothesis_id": spec.hypothesis_id, "research_status": "NOT_RUN",
                                  "reasons": ["no stored data for the protocol symbol"]}
+        if exp is not None:
+            # Baseline discipline: the baseline definition is registered under its own key *before* the run, so
+            # the candidate is derived as a new version with the baseline as parent — never stored as the baseline.
+            registered = registered or s.strategies.register(base)
+            # Design recorded before the run: the baseline is named explicitly and never silently replaced.
+            s.research_journal.append("experiment_design", {
+                "hypothesis_id": spec.hypothesis_id, "type": exp.type,
+                "independent_variables": list(exp.independent_variables), "dependent_variable": exp.dependent_variable,
+                "controls": exp.controls, "failure_criteria": exp.failure_criteria,
+                "stopping_criteria": exp.stopping_criteria, "success_criteria": [[c.metric, c.op, c.threshold]
+                                                                                 for c in criteria],
+                "baseline": {"strategy_key": base.key, "params": dict(P.BASE_PARAMS),
+                             "fingerprint": registered.definition_hash if registered else None},
+                "candidate_params": dict(exp.candidate_params) if exp.candidate_params else None,
+                "motivation": spec.motivation, "expected_mechanism": spec.expected_mechanism,
+                "evidence_refs": list(spec.evidence_refs), "learning_candidate_id": lc,
+                "objective_contract": objectives.CONTRACT.contract_hash, "budget_policy": budget.POLICY.policy_hash})
         full = Dataset.build(series, data_version="company-store",
                              realization=getattr(s.provider, "realization", "observed"))
         boundary = full.candles[int(len(full) * (1 - P.HOLDOUT_FRACTION))].open_time
         adversarial, promotion = self.research_policies
         r = run_research_cycle(s, full, boundary, hypothesis_id=spec.hypothesis_id, statement=spec.statement,
-                               base=P.base_definition(s.clock.now()), grid=P.GRID, criteria=tuple(criteria),
+                               base=base, grid=grid, criteria=tuple(criteria),
                                train_bars=P.TRAIN_BARS, test_bars=P.TEST_BARS, adversarial_policy=adversarial,
                                promotion_policy=promotion, min_candles=P.MIN_CANDLES)
-        return "COMPLETED", {"hypothesis_id": spec.hypothesis_id, "research_status": r.status,
-                             "reasons": list(r.reasons), "dev_verdict": r.dev_verdict and r.dev_verdict.value,
-                             "holdout_verdict": r.holdout_verdict and r.holdout_verdict.value,
-                             "promotion_approved": r.promotion.approved if r.promotion else None}
+        detail = {"hypothesis_id": spec.hypothesis_id, "research_status": r.status,
+                  "reasons": list(r.reasons), "dev_verdict": r.dev_verdict and r.dev_verdict.value,
+                  "holdout_verdict": r.holdout_verdict and r.holdout_verdict.value,
+                  "promotion_approved": r.promotion.approved if r.promotion else None}
+        if exp is not None and exp.candidate_params is not None and r.dev_verdict is not None:
+            detail["comparison"] = self._compare(spec, base, ResearchLog(s.research_journal), full, boundary)
+        self._link(spec)
+        return "COMPLETED", detail
+
+    def _link(self, spec) -> None:
+        if spec.learning_candidate_id is not None:
+            self.learning.link_hypothesis(spec.learning_candidate_id, spec.hypothesis_id)
+
+    def _registered(self, base):
+        try:
+            return self.s.strategies.get(base.key)
+        except KeyError:
+            return None
+
+    def _registered_with(self, base, params: dict):
+        target = tuple(sorted(params.items()))
+        for key in self.s.strategies.keys():
+            d = self.s.strategies.get(key)
+            if d.strategy_id == base.strategy_id and d.kind == base.kind and tuple(sorted(d.params)) == target:
+                return d
+        return None
+
+    def _compare(self, spec, base, log: ResearchLog, full: Dataset | None = None, boundary=None) -> dict:
+        """Baseline vs candidate on the *recorded* development partition only (never the holdout). Written once
+        per hypothesis to the research journal; the objective contract decides the conclusion, not Claude."""
+        s = self.s
+        existing = next((decode(e.payload) for e in s.research_journal.entries("experiment_comparison")
+                         if e.payload["hypothesis_id"] == spec.hypothesis_id), None)
+        if existing is not None:
+            return {"conclusion": existing["conclusion"], "recorded": True}
+        rows = [e for e in log.experiments if e["hypothesis_id"] == spec.hypothesis_id and e["stage"] == "walk_forward_oos"]
+        if not rows:
+            return {"conclusion": "NOT_AVAILABLE", "reason": "no development experiment recorded"}
+        row = rows[-1]
+        if full is None:
+            series = s.store.series(s.provider.name, P.SYMBOL, P.TIMEFRAME)
+            full = Dataset.build(series, data_version="company-store",
+                                 realization=getattr(s.provider, "realization", "observed"))
+            boundary = full.candles[int(len(full) * (1 - P.HOLDOUT_FRACTION))].open_time
+        dev = Dataset.build([c for c in full.candles if c.close_time <= boundary], data_version=full.identity.data_version,
+                            realization=full.identity.realization, partition=Partition.DEVELOPMENT)
+        if dev.dataset_id != row["dataset_id"]:
+            return {"conclusion": "NOT_AVAILABLE", "reason": "development partition does not match the recorded experiment"}
+        baseline = walk_forward(base, dev, [dict(P.BASE_PARAMS)], train_bars=P.TRAIN_BARS, test_bars=P.TEST_BARS)
+        candidate = Metrics(**row["metrics"])
+        stages = {e["stage"]: e["verdict"] for e in log.experiments
+                  if e["hypothesis_id"] in (spec.hypothesis_id, spec.hypothesis_id + ":holdout")}
+        adv = [decode(e.payload)["report"] for e in s.research_journal.entries("adversarial_report")]
+        verdicts = {"walk_forward_oos": stages.get("walk_forward_oos"), "holdout": stages.get("holdout")}
+        hold_id = spec.hypothesis_id + ":holdout"
+        challenger_hash = log.get(hold_id).strategy_hash if log.status(hold_id) != "UNKNOWN" else None
+        mine = [a for a in adv if a["dataset_id"] == dev.dataset_id and a["strategy_hash"] == challenger_hash]
+        if mine and stages.get("holdout") is not None:
+            blocking = any(o["verdict"] in ("FAIL", "INSUFFICIENT_EVIDENCE") for o in mine[-1]["objections"])
+            verdicts["adversarial"] = "BLOCKING" if blocking else "NON_BLOCKING"
+        result = objectives.compare(baseline.oos_metrics, candidate, verdicts)
+        s.research_journal.append("experiment_comparison", {
+            "hypothesis_id": spec.hypothesis_id, "dev_dataset_id": dev.dataset_id,
+            "baseline": {"strategy_key": base.key, "params": dict(P.BASE_PARAMS), "evidence_hash": baseline.evidence_hash},
+            "candidate": {"params": dict(spec.experiment.candidate_params), "evidence_hash": row["evidence_hash"]},
+            "verdicts": verdicts, **result})
+        return {"conclusion": result["conclusion"], "dimensions": result["dimensions"],
+                "constraint_violations": result["constraint_violations"][:4], "recorded": False}
 
     # --- finishing ---------------------------------------------------------------------------------------
     def _issue(self, cyc, request_id, prompt, packet, allowed) -> None:
@@ -387,6 +510,14 @@ class CompanyControlPlane:
 
     def _finish(self, cyc: CycleRecord, status: str, action: str | None, detail: dict,
                 health: HealthReport) -> CycleOutcome:
+        if "learn" not in cyc.steps:
+            # LEARN: deterministic, idempotent, from journals only. A learning failure is recorded, never hidden,
+            # and never changes the cycle's outcome (learning has no authority over what already happened).
+            try:
+                learned = self.learning.learn(self.s, self.loop.journal, self.journal)
+            except AtiError as exc:
+                learned = {"error": f"{type(exc).__name__}: {exc}"[:300]}
+            self._step(cyc, "learn", learned)
         self.journal.append("cycle_end", {"cycle_id": cyc.cycle_id, "status": status, "action": action,
                                           "detail": detail})
         cyc.status, cyc.result = status, {"status": status, "action": action, "detail": detail}
@@ -427,7 +558,8 @@ class CompanyControlPlane:
             last_prices={sym: ds.candles[-1].close for sym, ds in datasets.items()},
             evidence_exists=lambda r: r in s.evidence and s.evidence.resolve(r).available_at <= now,
             account_state_known=health.status("execution") is Status.PASS)
-        return CompanyContext(request_id, cyc.cycle_id, trade, PROTOCOLS)
+        return CompanyContext(request_id, cyc.cycle_id, trade, PROTOCOLS, PROTOCOL_PARAMS,
+                              lambda r: s.evidence.resolve(r).kind if r in s.evidence else None)
 
     def _positions(self, marks, symbol=None) -> list[dict]:
         out = []
@@ -486,4 +618,31 @@ class CompanyControlPlane:
                                         "locked_minimum_criteria": [[c.metric, c.op, c.threshold] for c in P.CRITERIA]}]},
             "memory": [{"kind": m.kind.value, "statement": m.statement, "confidence": m.confidence}
                        for m in s.memory.query(s.clock.now())[-10:]],
+            # Self-improvement context: informs Claude; none of it authorizes anything.
+            "autonomy": {"level": self.autonomy.name, "maximum_permitted": autonomy.maximum_permitted().name},
+            "objective": {"primary": objectives.CONTRACT.primary_objective,
+                          "contract_hash": objectives.CONTRACT.contract_hash,
+                          "constraints": {"max_drawdown": objectives.CONTRACT.max_drawdown,
+                                          "min_trades": objectives.CONTRACT.min_trades,
+                                          "max_top5_profit_share": objectives.CONTRACT.max_top5_profit_share,
+                                          "max_cost_share_of_gross": objectives.CONTRACT.max_cost_share_of_gross},
+                          "required_evidence": list(objectives.CONTRACT.required_verdicts)},
+            "research_budget": self._budget_view(),
+            "scorecard": scorecard.build(s, health, self.journal, self.learning),
+            "learning_candidates": self.learning.summary(s),
+            "failed_experiments": [{"hypothesis_id": e["hypothesis_id"], "stage": e["stage"], "verdict": e["verdict"]}
+                                   for e in (log.experiments if log else []) if e["verdict"] != "PASS"][-8:],
+            "validated_findings": [{"statement": m.statement, "confidence": m.confidence}
+                                   for m in s.memory.query(s.clock.now()) if m.kind is MemoryKind.VALIDATED_FINDING][-5:],
+            "experiment_protocol": {"types_executable": sorted(EXECUTABLE_EXPERIMENTS),
+                                    "baseline_params": PROTOCOL_PARAMS[P.PROTOCOL_ID]},
         }
+
+    def _budget_view(self) -> dict:
+        s = self.s
+        base = self._registered(P.base_definition(s.clock.now()))
+        try:
+            u = budget.usage(s, self.journal, s.clock.now(), base.definition_hash if base else None)
+        except AtiError:
+            return {"state": "UNAVAILABLE (research FAIL): no research may run"}
+        return {k: v for k, v in u.items() if k != "policy_hash"}

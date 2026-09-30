@@ -44,6 +44,16 @@ Vocabulary is exact. Nothing below is upgraded from one state to another.
 | Direct Claude API reasoning client | NOT IMPLEMENTED (BLOCKED — CREDENTIALS) |
 | Autonomous loop (resumable tick) | IMPLEMENTED |
 | Company control plane (Phase 1: closed actions, health gate, pause, recovery, idempotent cycles) | IMPLEMENTED (MOCK data and REAL-unavailable paths verified; REAL-available path untested — no REAL data) |
+| Outcome learning / LEARN stage (outcome records, deterministic detectors, learning candidates, evidence-quality ladder, holdout-derived isolation) | IMPLEMENTED (MOCK outcomes only; no candidate has market evidence) |
+| Experiment design contract (SINGLE_VARIABLE, INTERACTION executed; design + baseline recorded before the run; dev-only baseline/candidate comparison) | IMPLEMENTED |
+| STRUCTURAL / REGIME / EXECUTION / RISK experiment executors | NOT IMPLEMENTED (representable in the schema; the control plane BLOCKS them) |
+| Objective contract (constraints, failure conditions, evidence requirements; no single score) | IMPLEMENTED |
+| Research budget (hypotheses, variants per baseline, holdouts, runs per day — derived from journals) | IMPLEMENTED |
+| Autonomy levels (ceiling PAPER_AUTONOMY; SUPERVISED_LIVE / FULL_LIVE impossible) | IMPLEMENTED |
+| Company scorecard (10 independent dimensions, no aggregate) | IMPLEMENTED |
+| Multi-source DATA_CONFLICT (comparator, persistent register, health gate, operator-only resolution) | IMPLEMENTED (exercised with two MOCK sources; a second real source is NOT IMPLEMENTED) |
+| Text/news evidence layering (raw / verbatim facts / model interpretation; one source per source id) | IMPLEMENTED (structure only); news ingestion NOT IMPLEMENTED |
+| Validated doctrine from learning | INSUFFICIENT EVIDENCE — requires holdout PASS + approved promotion on market data; none exists |
 | Claude company decisions via file exchange | IMPLEMENTED — manual: a Claude session must write each response file |
 | Scheduled autonomous operation (Routine driving the loop) | NOT IMPLEMENTED (mechanism available, not configured) |
 | Status view | IMPLEMENTED (CLI demo prints it) |

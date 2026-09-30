@@ -13,7 +13,7 @@ from __future__ import annotations
 import json
 import math
 import re
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal, InvalidOperation
 from typing import Any, Callable
 
@@ -247,7 +247,9 @@ _COMPANY_PAYLOAD = {
                                   "invalidation_condition", "confidence"}),
                        frozenset({"proposed_qty", "target_price", "evidence_refs"})),
     "RESEARCH_REQUEST": (frozenset({"hypothesis_id", "protocol_id", "question", "statement", "strategy_key",
-                                    "evidence_requested", "success_criteria"}), frozenset({"scope"})),
+                                    "evidence_requested", "success_criteria"}),
+                         frozenset({"scope", "motivation", "expected_mechanism", "evidence_refs",
+                                    "learning_candidate_id", "experiment"})),
     "PAUSE": (frozenset(), frozenset()),
     "REQUEST_DATA": (frozenset({"need"}), frozenset({"symbol"})),
     "REVIEW_POSITION": (frozenset(), frozenset({"symbol"})),
@@ -255,6 +257,16 @@ _COMPANY_PAYLOAD = {
     "REVIEW_SYSTEM": (frozenset(), frozenset()),
 }
 RESEARCH_EVIDENCE_TYPES = frozenset({"walk_forward", "robustness", "adversarial", "holdout"})
+# Experiment design (optional part of a RESEARCH_REQUEST). All six types are representable; which ones the
+# control plane can *execute* is decided there (unimplemented executors are BLOCKED, never approximated).
+EXPERIMENT_TYPES = frozenset({"SINGLE_VARIABLE", "INTERACTION", "STRUCTURAL", "REGIME", "EXECUTION", "RISK"})
+_EXPERIMENT_FIELDS = frozenset({"type", "independent_variables", "dependent_variable", "controls",
+                                "failure_criteria", "stopping_criteria"})
+_EXPERIMENT_OPTIONAL = frozenset({"candidate_params"})
+# Evidence a hypothesis may cite. Holdout and promotion outcomes are evaluation results: citing them as
+# motivation for a new hypothesis would turn the holdout into training feedback.
+_NON_CITABLE_EVIDENCE = frozenset({"holdout", "promotion"})
+_CANDIDATE_ID = re.compile(r"^lc_[0-9a-f]{20}$")
 _HYPOTHESIS_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$")
 _EXECUTABLE = [re.compile(p, re.IGNORECASE) for p in (
     r"`", r"\$\(", r"\$\{", r"\bsudo\b", r"\brm\s+-", r"\bchmod\b", r"\bcurl\s+\S", r"\bwget\s+\S",
@@ -273,6 +285,22 @@ class ResearchSpec:
     evidence_requested: tuple[str, ...]
     success_criteria: tuple[tuple[str, str, float], ...]
     scope: str
+    motivation: str = ""
+    expected_mechanism: str = ""
+    evidence_refs: tuple[str, ...] = ()
+    learning_candidate_id: str | None = None
+    experiment: "ExperimentSpec | None" = None
+
+
+@dataclass(frozen=True)
+class ExperimentSpec:
+    type: str
+    independent_variables: tuple[str, ...]
+    dependent_variable: str
+    controls: str
+    failure_criteria: str
+    stopping_criteria: str
+    candidate_params: tuple[tuple[str, object], ...] | None   # None = the protocol baseline itself
 
 
 @dataclass(frozen=True)
@@ -293,6 +321,8 @@ class CompanyContext:
     cycle_id: str
     trade: ValidationContext
     protocols: dict[str, str]            # protocol_id → the strategy key it is locked to
+    protocol_params: dict[str, dict] = field(default_factory=dict)   # protocol_id → baseline parameters
+    evidence_kind: Callable[[str], str | None] = lambda ref: None    # ref → evidence kind (None = unknown)
 
 
 def _refuse_executable(value, where: str = "response") -> None:
@@ -369,5 +399,72 @@ def _research_spec(p: dict, ctx: CompanyContext) -> ResearchSpec:
         except (ValueError, TypeError) as exc:
             raise SchemaViolation(f"invalid criterion: {exc}") from None
         parsed.append((c["metric"], c["op"], float(t)))
+    refs = p.get("evidence_refs", [])
+    if not isinstance(refs, list) or len(refs) > 12 or not all(isinstance(r, str) for r in refs) \
+            or len(set(refs)) != len(refs):
+        raise SchemaViolation("evidence_refs must be a list of at most 12 distinct strings")
+    for r in refs:
+        kind = ctx.evidence_kind(r)
+        if kind is None or not ctx.trade.evidence_exists(r):
+            raise SchemaViolation(f"evidence ref {r!r} does not resolve to point-in-time evidence")
+        if kind in _NON_CITABLE_EVIDENCE:
+            raise SchemaViolation(f"evidence ref {r!r} is {kind} evidence: holdout/promotion outcomes cannot "
+                                  "motivate a new hypothesis")
+    lc = p.get("learning_candidate_id")
+    if lc is not None and (not isinstance(lc, str) or not _CANDIDATE_ID.match(lc)):
+        raise SchemaViolation("learning_candidate_id must be a learning candidate id (lc_ + 20 hex)")
+    experiment = _experiment(p["experiment"], ctx.protocol_params.get(p["protocol_id"], {})) \
+        if "experiment" in p else None
     return ResearchSpec(hid, p["protocol_id"], _text(p, "question"), _text(p, "statement"), p["strategy_key"],
-                        tuple(ev), tuple(parsed), _text(p, "scope", required=False, limit=300))
+                        tuple(ev), tuple(parsed), _text(p, "scope", required=False, limit=300),
+                        _text(p, "motivation", required=False, limit=400),
+                        _text(p, "expected_mechanism", required=False, limit=400), tuple(refs), lc, experiment)
+
+
+def _experiment(e, base: dict) -> ExperimentSpec:
+    """Structure and internal consistency only. The executor decides what may run."""
+    if not isinstance(e, dict):
+        raise SchemaViolation("experiment must be an object")
+    missing, extra = _EXPERIMENT_FIELDS - e.keys(), e.keys() - _EXPERIMENT_FIELDS - _EXPERIMENT_OPTIONAL
+    if missing or extra:
+        raise SchemaViolation(f"experiment: missing {sorted(missing)} / unrecognized {sorted(extra)} fields")
+    kind = e["type"]
+    if kind not in EXPERIMENT_TYPES:
+        raise SchemaViolation(f"experiment type must be one of {sorted(EXPERIMENT_TYPES)}")
+    iv = e["independent_variables"]
+    if not isinstance(iv, list) or not iv or len(iv) > 4 or not all(isinstance(v, str) and len(v) <= 40 for v in iv) \
+            or len(set(iv)) != len(iv):
+        raise SchemaViolation("independent_variables must be 1-4 distinct short names")
+    from ati.research.hypothesis import Criterion  # local import: research depends on nothing here
+    dv = e["dependent_variable"]
+    try:
+        Criterion(dv, ">", 0.0)
+    except (ValueError, TypeError):
+        raise SchemaViolation(f"dependent_variable {dv!r} is not a recorded metric") from None
+    texts = {k: _text(e, k, limit=300) for k in ("controls", "failure_criteria", "stopping_criteria")}
+    params = None
+    if "candidate_params" in e:
+        cp = e["candidate_params"]
+        if not isinstance(cp, dict) or not base or set(cp) != set(base):
+            raise SchemaViolation("candidate_params must give every baseline parameter (and nothing else)")
+        cp = dict(cp)
+        for k, v in cp.items():
+            if isinstance(base[k], float) and isinstance(v, int) and not isinstance(v, bool):
+                cp[k] = v = float(v)
+            if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v) \
+                    or type(v) is not type(base[k]) or v <= 0:
+                raise SchemaViolation(f"candidate_params.{k} must be a finite positive {type(base[k]).__name__}")
+        changed = sorted(k for k in cp if cp[k] != base[k])
+        if kind == "SINGLE_VARIABLE" and len(changed) != 1:
+            raise SchemaViolation(f"SINGLE_VARIABLE changes exactly one parameter (changed: {changed})")
+        if kind == "INTERACTION" and len(changed) < 2:
+            raise SchemaViolation(f"INTERACTION changes at least two parameters (changed: {changed})")
+        if kind in ("SINGLE_VARIABLE", "INTERACTION") and sorted(iv) != changed:
+            raise SchemaViolation(f"independent_variables {sorted(iv)} must name exactly the changed parameters {changed}")
+        if kind == "REGIME" and changed:
+            raise SchemaViolation("REGIME experiments hold parameters fixed (the regime is the variable)")
+        params = tuple(sorted(cp.items()))
+    elif kind in ("SINGLE_VARIABLE", "INTERACTION"):
+        raise SchemaViolation(f"{kind} experiments require candidate_params")
+    return ExperimentSpec(kind, tuple(iv), dv, texts["controls"], texts["failure_criteria"], texts["stopping_criteria"],
+                          params)

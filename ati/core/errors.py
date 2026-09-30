@@ -52,6 +52,18 @@ class CompanyStateError(AtiError):
     """Company control-plane state is illegal, contradictory or unreadable. Fail closed."""
 
 
+class DataConflictError(AtiError):
+    """Independent sources disagree about the same market fact beyond tolerance. Research is blocked."""
+
+
+class LearningIntegrityError(AtiError):
+    """A learning record is illegal (unknown candidate, holdout-derived learning used as motivation, …)."""
+
+
+class TextEvidenceError(AtiError, ValueError):
+    """Text evidence would mix raw source, extracted facts and model interpretation, or lacks provenance."""
+
+
 class LifecycleError(AtiError):
     """Illegal strategy / memory lifecycle transition."""
 

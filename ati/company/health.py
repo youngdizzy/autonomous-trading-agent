@@ -109,7 +109,7 @@ def _journal_ok(journal: Journal) -> str | None:
         return f"{type(exc).__name__}: {exc}"
 
 
-def assess(system, loop, datasets: dict, company_journal: Journal, paused: bool) -> HealthReport:
+def assess(system, loop, datasets: dict, company_journal: Journal, paused: bool, conflicts=None) -> HealthReport:
     s = system
     checks: list[Check] = []
 
@@ -119,7 +119,11 @@ def assess(system, loop, datasets: dict, company_journal: Journal, paused: bool)
     champion = s.strategies.champion()
     need_bars = champion.lookback if champion else 1
     categories = {c.status for sym in s.symbols for c in s.store.series(s.provider.name, sym, s.timeframe)}
-    if len(categories) > 1 or (categories and categories != {s.data_status}):
+    if conflicts is not None and conflicts.open:
+        ids = sorted(conflicts.open)[:3]
+        state, check = DataState.INVALID_DATA, Check("data", Status.FAIL,
+                                                     f"DATA_CONFLICT: {len(conflicts.open)} open source conflict(s) {ids}")
+    elif len(categories) > 1 or (categories and categories != {s.data_status}):
         state, check = DataState.MIXED_DATA, Check("data", Status.FAIL, f"categories {sorted(c.value for c in categories)}")
     elif isinstance(err, ModeMismatch) or (isinstance(err, DataIntegrityError) and err.code == "STATUS_MIX"):
         state, check = DataState.MIXED_DATA, Check("data", Status.FAIL, str(err)[:300])
