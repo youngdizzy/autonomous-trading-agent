@@ -140,3 +140,8 @@ class SecretLeakError(AtiError):
 
 class StateLocked(AtiError):
     """Another process holds the state directory. Nothing was written."""
+
+
+class ExternalSourceError(AtiError):
+    """An external strategy source cannot be identified, read or reconciled with its recorded identity
+    (e.g. the same repository/commit/path now yields different bytes). Nothing is imported. Fail closed."""

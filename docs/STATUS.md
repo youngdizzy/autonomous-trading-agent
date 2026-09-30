@@ -31,6 +31,9 @@ Vocabulary is exact. Nothing below is upgraded from one state to another.
 | REAL research readiness (3,000-candle protocol minimum) | REAL_DATA_UNAVAILABLE; Kraken's OHLC endpoint returns ≤ 720 bars, so reaching 3,000 1h bars needs ~95 days of uninterrupted hourly accumulation (deep backfill NOT IMPLEMENTED) |
 | stdlib HTTPS transport | IMPLEMENTED — EXTERNAL VERIFICATION BLOCKED |
 | Deep historical backfill (Kraken Trades endpoint or other) | NOT IMPLEMENTED |
+| External strategy intake (`ati/intake`, `ati intake-vault`: git-commit source identity, safe text parsing, compatibility states, EXTERNAL_CLAIM separation, research universes, research via the existing workflow) | IMPLEMENTED; pilot of 24 Quant Trading Vault files @ c9d6fa49: 0 COMPATIBLE, nothing researched |
+| Normalizers for JavaScript, Python, MyLanguage, C++ sources; Pine constructs beyond mapping rule `map-1` (ma_crossover) | NOT IMPLEMENTED |
+| Mass import of the external corpus (5,806 files) | NOT IMPLEMENTED (deliberately: pilot only) |
 | Fail-closed historical store | IMPLEMENTED |
 | Dataset identity, mutation detection, save/load | IMPLEMENTED |
 | Point-in-time views, information sets, lookahead tests | IMPLEMENTED |

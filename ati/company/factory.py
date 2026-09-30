@@ -61,7 +61,12 @@ def attempts(system, hypothesis_id: str) -> dict:
             "rejected_strategies_before": sum(1 for e in before if e.type == "strategy_lifecycle" and e.payload["to"] == "REJECTED"),
             "holdout_evaluations_before": sum(1 for e in before if e.type == "holdout_access"),
             "same_idea_tested_before": sum(1 for h, st in statements.items() if h in roots and this and norm(st) == norm(this)),
-            "independent_datasets_before": len({x["dataset_id"] for x in exps})}
+            "independent_datasets_before": len({x["dataset_id"] for x in exps}),
+            # external corpora (ati.intake): every selection batch recorded before this hypothesis counts, researched
+            # or not — a candidate picked from a large corpus carries the size of the search that produced it
+            "external_universes_before": sum(1 for e in before if e.type == "research_universe"),
+            "external_candidates_considered_before": sum(e.payload["number_of_candidates_considered"]
+                                                         for e in before if e.type == "research_universe")}
 
 
 def review(system, fingerprint: str) -> dict:

@@ -7,6 +7,7 @@
     python -m ati accumulate --state-dir DIR --data kraken|mock   BTC/ETH × 1h/4h incremental accumulation
     python -m ati data-health --state-dir DIR --data kraken|mock  read-only dataset scorecard and health
     python -m ati company cycle|status|pause|resume --state-dir DIR --data mock|kraken
+    python -m ati intake-vault --state-dir DIR --data mock|kraken --corpus PATH --manifest FILE --commit SHA
                                                   one bounded company control-plane cycle (no loop, no daemon)
 
 Everything the demo produces is MOCK: generated prices, scripted reasoning. It exercises the
@@ -217,6 +218,41 @@ def accumulate_cmd(state_dir: Path, data: str) -> int:
     return 0 if all(r.status in ("ACCUMULATED", "NO_NEW_DATA") for r in results) else 3
 
 
+def intake_vault_cmd(state_dir: Path, data: str, corpus_dir: Path, manifest: Path, repository: str, commit: str,
+                     batch: str, salt: str, per_language: str) -> int:
+    """Pilot intake of an external strategy corpus (text only; nothing external is executed). Output: one normalized
+    record per selected source and the research-universe record. Research of COMPATIBLE candidates is a separate,
+    explicit step through the existing workflow — never automatic."""
+    from ati.core.errors import AtiError as _AtiError
+    from ati.core.lock import StateLock
+    from ati.intake.corpus import ExternalIntake
+    from ati.intake.source import GitCorpus
+
+    quota = {k: int(v) for k, v in (item.split("=") for item in per_language.split(",") if item)}
+    if sum(quota.values()) > 25:
+        print("REFUSED: a pilot is at most 25 strategies")
+        return 2
+    try:
+        with StateLock(state_dir):
+            s = _data_system(state_dir, data)
+            corpus = GitCorpus(corpus_dir, repository, commit, manifest)
+            intake = ExternalIntake(s.research_journal)
+            chosen, census = intake.select_pilot(corpus, quota, salt)
+            records = [intake.ingest(a) for a in corpus.read_many(chosen)]
+            universe = intake.record_universe(corpus, batch, chosen, census, salt, quota)
+    except _AtiError as exc:
+        print(f"INTAKE REFUSED: {type(exc).__name__}: {exc}")
+        return 5
+    keep = ("external_strategy_id", "source_path", "source_hash", "source_language", "strategy_family",
+            "normalization_status", "compatibility_status", "tradetown_strategy_id", "normalized_strategy_hash")
+    print(json.dumps({"records": [{k: r.get(k) for k in keep} | {"reasons": [x["state"] + ": " + x["reason"]
+                                                                               for x in r["reasons"]]}
+                                  for r in records],
+                      "universe": intake.universe_summary(universe["universe_id"]), "census": census},
+                     indent=2, default=str))
+    return 0
+
+
 def data_health_cmd(state_dir: Path, data: str) -> int:
     from ati.core.errors import AtiError as _AtiError
     from ati.market.accumulate import SERIES
@@ -349,6 +385,17 @@ def main(argv: list[str] | None = None) -> int:
         a = sub.add_parser(name, help=text)
         a.add_argument("--state-dir", type=Path, required=True)
         a.add_argument("--data", choices=["mock", "kraken"], required=True)
+    iv = sub.add_parser("intake-vault", help="pilot intake of an external strategy corpus (research candidates only)")
+    iv.add_argument("--state-dir", type=Path, required=True)
+    iv.add_argument("--data", choices=["mock", "kraken"], required=True)
+    iv.add_argument("--corpus", type=Path, required=True, help="git checkout of the corpus repository")
+    iv.add_argument("--manifest", type=Path, required=True,
+                    help="`git -C CORPUS ls-tree -r -z COMMIT` output (run by the operator; the system never shells out)")
+    iv.add_argument("--repository", default="brainbrick-trades/The-Quant-Trading-Vault")
+    iv.add_argument("--commit", required=True, help="full 40-hex commit to read sources at")
+    iv.add_argument("--batch", default="pilot-1")
+    iv.add_argument("--salt", default="tradetown-vault-pilot-1")
+    iv.add_argument("--per-language", default="PineScript=14,javascript=4,python=3,MyLanguage=2,cpp=1")
     c = sub.add_parser("company", help="company control plane: one bounded cycle, status, pause, resume")
     c.add_argument("action", choices=["cycle", "run", "status", "readiness", "report", "pause", "resume"])
     c.add_argument("--state-dir", type=Path, required=True)
@@ -362,6 +409,9 @@ def main(argv: list[str] | None = None) -> int:
         from ati.core.lock import StateLock
         with StateLock(args.state_dir):
             return ingest_kraken(args.state_dir, args.symbol)
+    if args.cmd == "intake-vault":
+        return intake_vault_cmd(args.state_dir, args.data, args.corpus, args.manifest, args.repository, args.commit,
+                                args.batch, args.salt, args.per_language)
     if args.cmd == "accumulate":
         return accumulate_cmd(args.state_dir, args.data)
     if args.cmd == "data-health":
