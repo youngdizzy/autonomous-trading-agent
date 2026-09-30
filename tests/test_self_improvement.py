@@ -33,10 +33,24 @@ ROOT = Path(__file__).resolve().parents[1]
 
 def experiment(kind="SINGLE_VARIABLE", params=None, iv=None, **over):
     params = params if params is not None else {"fast": 20, "slow": 50, "atr_period": 14, "stop_atr": 3.0}
-    return {"type": kind, "independent_variables": iv or ["fast"], "dependent_variable": "expectancy_r",
+    body = {"type": kind, "independent_variables": iv or ["fast"], "dependent_variable": "expectancy_r",
             "controls": "same data, costs, walk-forward windows and criteria as the baseline",
             "failure_criteria": "expectancy not above baseline on development data",
-            "stopping_criteria": "one pre-registered run; no retries", "candidate_params": params} | over
+            "stopping_criteria": "one pre-registered run; no retries",
+            "design_rationale": "one variable isolates the effect of entry responsiveness", "candidate_params": params}
+    return body | over
+
+
+def condition_experiment(kind, condition, **over):
+    body = {k: v for k, v in experiment(kind, iv=list(condition)).items() if k != "candidate_params"}
+    return body | {"condition": condition, "design_rationale": f"{kind.lower()} question about the fixed baseline"} | over
+
+
+def designed(hid="H-co-1", exp=None, **over):
+    """A RESEARCH_REQUEST carrying an experiment design (motivation and mechanism are then mandatory)."""
+    return research_payload(hid, experiment=exp if exp is not None else experiment(),
+                            motivation="recurring observation worth testing",
+                            expected_mechanism="the stated variable changes when and how often trends are captured") | over
 
 
 def metrics(**over) -> Metrics:
@@ -132,7 +146,14 @@ class TestExperimentSchema:
         (experiment(params={"fast": 20, "slow": 100, "atr_period": 14, "stop_atr": 3.0}), "exactly one parameter"),
         (experiment("INTERACTION", iv=["fast"]), "at least two"),
         (experiment(iv=["slow"]), "must name exactly the changed"),
-        (experiment("REGIME"), "hold parameters fixed"),
+        (experiment("REGIME"), "do not take ['candidate_params']"),
+        (condition_experiment("EXECUTION", {"cost_multiplier": 0.5}), "never reduced below the model"),
+        (condition_experiment("RISK", {"risk_fraction": 0.5}), "risk_fraction must be within"),
+        (condition_experiment("REGIME", {"regime": "MOON/UP"}), "regime must be one of"),
+        (condition_experiment("REGIME", {"regime": "HIGH_VOL/UP"}, independent_variables=["fast"]), "exactly ['regime']"),
+        ({k: v for k, v in experiment().items() if k != "design_rationale"}, "design_rationale"),
+        ({k: v for k, v in experiment("STRUCTURAL", iv=["structure"]).items() if k != "candidate_params"}
+         | {"structure": {"kind": "not a kind", "params": {}}}, "structure must be"),
         (experiment("MAGIC"), "experiment type"),
         (experiment(params={"fast": 20, "slow": 50, "atr_period": 14, "stop_atr": 3.0, "leverage": 5}), "every baseline"),
         (experiment(params={"fast": -5, "slow": 50, "atr_period": 14, "stop_atr": 3.0}), "positive"),
@@ -141,7 +162,7 @@ class TestExperimentSchema:
         ({k: v for k, v in experiment().items() if k != "candidate_params"}, "require candidate_params"),
     ])
     def test_malformed_experiments_rejected(self, tmp_path, exp, needle):
-        cp, s, _ = plane(tmp_path / "st", script={"company": reply("RESEARCH_REQUEST", research_payload(experiment=exp))})
+        cp, s, _ = plane(tmp_path / "st", script={"company": reply("RESEARCH_REQUEST", designed(exp=exp))})
         out = cp.run_cycle()
         assert out.status == "FAILED" and needle in out.detail["reason"], out.detail
         assert counts(s)["experiments"] == 0
@@ -159,25 +180,29 @@ class TestExperimentSchema:
         out = cp.run_cycle()
         assert out.status == "FAILED" and "does not resolve" in out.detail["reason"]
 
-    @pytest.mark.parametrize("kind", ["STRUCTURAL", "EXECUTION", "RISK", "REGIME"])
-    def test_unimplemented_executors_block_without_running(self, tmp_path, kind):
-        exp = {k: v for k, v in experiment(kind).items() if k != "candidate_params"}
-        cp, s, _ = plane(tmp_path / "st", script={"company": reply("RESEARCH_REQUEST", research_payload(experiment=exp))})
+    def test_designed_experiment_requires_motivation_and_mechanism(self, tmp_path):
+        cp, s, _ = plane(tmp_path / "st", script={"company": reply("RESEARCH_REQUEST",
+                                                                   research_payload(experiment=experiment()))})
         out = cp.run_cycle()
-        assert out.status == "BLOCKED" and "NOT IMPLEMENTED" in out.detail["reason"]
-        assert counts(s)["experiments"] == 0 and not any(True for _ in s.research_journal.entries("experiment_design"))
+        assert out.status == "FAILED" and "motivation" in out.detail["reason"]
+
+    def test_learning_candidate_hypothesis_requires_a_design(self, tmp_path):
+        cp, s, _ = plane(tmp_path / "st", script={"company": reply(
+            "RESEARCH_REQUEST", research_payload(learning_candidate_id="lc_" + "0" * 20))})
+        out = cp.run_cycle()
+        assert out.status == "FAILED" and "explicit experiment design" in out.detail["reason"]
 
     def test_unknown_learning_candidate_blocks(self, tmp_path):
         cp, s, _ = plane(tmp_path / "st", script={"company": reply(
-            "RESEARCH_REQUEST", research_payload(learning_candidate_id="lc_" + "0" * 20))})
+            "RESEARCH_REQUEST", designed(learning_candidate_id="lc_" + "0" * 20))})
         out = cp.run_cycle()
         assert out.status == "BLOCKED" and "unknown learning candidate" in out.detail["reason"]
 
 
 class TestSingleVariableExperiment:
     def test_design_recorded_before_run_baseline_kept_and_compared(self, tmp_path):
-        payload = research_payload("H-sv-1", experiment=experiment(), motivation="shorter fast MA reacts earlier",
-                                   expected_mechanism="earlier entries capture more of each trend")
+        payload = designed("H-sv-1", motivation="shorter fast MA reacts earlier",
+                           expected_mechanism="earlier entries capture more of each trend")
         cp, s, _ = plane(tmp_path / "st", hours=3200, policies=MECHANICS,
                          script={"company": reply("RESEARCH_REQUEST", payload)})
         with_history(s, 3200)
@@ -188,20 +213,37 @@ class TestSingleVariableExperiment:
         assert seq["experiment_design"] < seq["preregistration"]  # design locked before any test
         design = next(e.payload for e in entries if e.type == "experiment_design")
         assert design["baseline"]["params"] == {"fast": 10, "slow": 50, "atr_period": 14, "stop_atr": 3.0}
-        assert design["candidate_params"]["fast"] == 20 and design["objective_contract"] == objectives.CONTRACT.contract_hash
+        assert design["candidate"]["params"]["fast"] == 20 and design["experiment_id"].startswith("exp_") and design["objective_contract"] == objectives.CONTRACT.contract_hash
         # the walk-forward tested exactly the candidate; the baseline definition is unchanged in the registry
         wf_rows = [e for e in ResearchLog(s.research_journal).experiments if e["stage"] == "walk_forward_oos"]
         assert len(wf_rows) == 1
         comp = [e.payload for e in s.research_journal.entries("experiment_comparison")]
         assert len(comp) == 1 and comp[0]["conclusion"] in {c.value for c in objectives.Conclusion}
         assert comp[0]["dev_dataset_id"] == wf_rows[0]["dataset_id"]            # development partition only
-        assert "promot" in comp[0]["note"] and comp[0]["baseline"]["params"]["fast"] == 10
+        assert "promot" in comp[0]["note"] and comp[0]["baseline_replaced"] is False
+        for side in ("baseline", "candidate"):
+            assert {f"{side}_strategy", f"{side}_fingerprint", f"{side}_dataset", f"{side}_results"} <= set(comp[0])
+        assert comp[0]["baseline_strategy"] == "trend@v1" and comp[0]["candidate_evidence"] == wf_rows[0]["evidence_hash"]
+        assert comp[0]["baseline_dataset"] == comp[0]["candidate_dataset"] == wf_rows[0]["dataset_id"]
+        assert "wfo_stability" in comp[0]["dimensions"] and comp[0]["not_measured"]
         assert out.detail["comparison"]["conclusion"] == comp[0]["conclusion"]
         # baseline never silently replaced: trend@v1 keeps the baseline params; the candidate is a child version
         baseline = s.strategies.get("trend@v1")
         assert baseline.param_dict["fast"] == 10 and design["baseline"]["fingerprint"] == baseline.definition_hash
         children = [s.strategies.get(k) for k in s.strategies.keys() if s.strategies.get(k).parent_hash == baseline.definition_hash]
         assert len(children) == 1 and children[0].param_dict["fast"] == 20 and children[0].key != "trend@v1"
+        # candidate factory: lineage record binds fingerprint, parent, hypothesis, experiment, datasets, code identity
+        lineage = [e.payload for e in s.research_journal.entries("candidate_lineage")]
+        assert len(lineage) == 1 and lineage[0]["fingerprint"] == children[0].definition_hash
+        assert lineage[0]["parent_fingerprint"] == baseline.definition_hash == lineage[0]["baseline_fingerprint"]
+        assert lineage[0]["hypothesis_id"] == "H-sv-1" and lineage[0]["experiment_id"] == design["experiment_id"]
+        assert lineage[0]["datasets"]["development"] == wf_rows[0]["dataset_id"] and lineage[0]["code_hash"]
+        assert lineage[0]["provenance"]["data_status"] == "MOCK"
+        from ati.company import factory
+        trail = factory.stages(s, children[0].definition_hash)
+        assert trail["stages"]["CANDIDATE_GENERATED"] == children[0].key and trail["stages"]["WFO"] == "PASS"
+        assert trail["stages"]["ADVERSARIAL"] != "NOT_REACHED" and trail["stages"]["PROMOTION_REVIEW"] != "NOT_REACHED"
+        assert trail["stages"]["VALIDATION"] == ("APPROVED" if out.detail["promotion_approved"] else "DENIED")
         # the LEARN stage ran for this cycle and learned from the experiment outcome(s)
         learn = next(e.payload for e in cp.journal.entries("cycle_step") if e.payload["step"] == "learn")
         assert learn["data"]["new_outcomes"] >= 1
@@ -266,7 +308,7 @@ class TestLearning:
         c = next(c for c in cp.learning.candidates.values() if c.pattern == "HOLDOUT_FAILURE")
         assert c.holdout_derived and len(c.evidence) == 5
         assert c.state is CandidateState.ANALYZED and not c.research_eligible   # stops short of HYPOTHESIS_CANDIDATE
-        s.reasoning.script["company"] = reply("RESEARCH_REQUEST", research_payload(learning_candidate_id=c.candidate_id))
+        s.reasoning.script["company"] = reply("RESEARCH_REQUEST", designed(learning_candidate_id=c.candidate_id))
         clock.advance(timedelta(hours=1))
         out = cp.run_cycle()
         assert out.status == "BLOCKED" and "holdout" in out.detail["reason"]
@@ -401,8 +443,8 @@ class TestLearningToResearch:
             clock.advance(timedelta(hours=1))
         c = next(c for c in cp.learning.candidates.values() if c.pattern == "CONTRACT_REJECTION")
         assert c.research_eligible
-        s.reasoning.script["company"] = reply("RESEARCH_REQUEST", research_payload(
-            "H-lc-1", learning_candidate_id=c.candidate_id, experiment=experiment()))
+        s.reasoning.script["company"] = reply("RESEARCH_REQUEST", designed(
+            "H-lc-1", learning_candidate_id=c.candidate_id))
         out = cp.run_cycle()
         assert out.status == "COMPLETED", out.detail
         c = cp.learning.candidates[c.candidate_id]
@@ -420,7 +462,7 @@ class TestLearningToResearch:
         # MOCK data can never reach VALIDATED_EVIDENCE, whatever the outcome
         assert cp.learning.quality(c, s) is not Quality.VALIDATED_EVIDENCE
         # a second request citing a now-terminal candidate is refused
-        s.reasoning.script["company"] = reply("RESEARCH_REQUEST", research_payload(
+        s.reasoning.script["company"] = reply("RESEARCH_REQUEST", designed(
             "H-lc-2", learning_candidate_id=c.candidate_id))
         clock.advance(timedelta(hours=1))
         out2 = cp.run_cycle()

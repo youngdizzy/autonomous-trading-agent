@@ -97,11 +97,20 @@ def constraint_violations(m: Metrics, contract: ObjectiveContract = CONTRACT) ->
     return out
 
 
+# Dimensions computed outside Metrics, passed as (baseline, candidate) values.
+EXTRA_DIMENSIONS = {"wfo_stability": Dimension("wfo_stability", "positive_fold_fraction", Direction.HIGHER, 0.05)}
+# Dimensions the champion/challenger comparison should cover but this build cannot measure honestly.
+NOT_MEASURED = ("volatility_of_returns", "regime_behavior", "parameter_sensitivity")
+
+
 def compare(baseline: Metrics, candidate: Metrics, verdicts: dict[str, str],
-            contract: ObjectiveContract = CONTRACT) -> dict:
+            contract: ObjectiveContract = CONTRACT, extra: dict[str, tuple] | None = None) -> dict:
     """Baseline vs candidate on the *development* partition, plus the recorded stage verdicts.
-    Returns a per-dimension profile and a conclusion; never a single score."""
+    Returns a per-dimension profile and a conclusion; never a single score. Robustness, adversarial and holdout
+    performance enter only through the recorded verdicts (evidence requirements), never as a metric trade-off."""
     dims = {d.name: _cmp(d, getattr(baseline, d.metric), getattr(candidate, d.metric)) for d in DIMENSIONS}
+    for name, (b, c) in (extra or {}).items():
+        dims[name] = _cmp(EXTRA_DIMENSIONS[name], b, c)
     violations = constraint_violations(candidate, contract)
     missing = [r for r in contract.required_verdicts
                if verdicts.get(r.split(":")[0]) != r.split(":")[1]]
@@ -115,7 +124,8 @@ def compare(baseline: Metrics, candidate: Metrics, verdicts: dict[str, str],
         conclusion = Conclusion.IMPROVED_ON_DEVELOPMENT
     else:
         conclusion = Conclusion.INCONCLUSIVE
-    return {"contract_hash": contract.contract_hash, "dimensions": dims, "constraint_violations": violations,
+    return {"contract_hash": contract.contract_hash, "dimensions": dims, "not_measured": list(NOT_MEASURED),
+            "constraint_violations": violations,
             "missing_evidence": missing, "conclusion": conclusion.value,
             "note": "development-partition comparison; promotion is decided only by the promotion gate"}
 

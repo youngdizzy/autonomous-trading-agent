@@ -80,17 +80,35 @@ The cycle ends with a mandatory **LEARN** step (journaled once per cycle, idempo
   VALIDATED (SUPPORTED on market data with an approved promotion). A source event counts once.
 - **Holdout isolation**: holdout and promotion outcomes are recorded but `holdout_derived`; they never become
   research-eligible, and holdout/promotion evidence refs cannot motivate a RESEARCH_REQUEST.
-- **Experiment design** (optional `experiment` in RESEARCH_REQUEST): type, independent variables, dependent
-  variable, controls, failure and stopping criteria, candidate params. SINGLE_VARIABLE changes exactly one
-  baseline parameter and INTERACTION changes two or more. Both are executed. STRUCTURAL, REGIME, EXECUTION and
-  RISK are BLOCKED (their executors are NOT IMPLEMENTED). The design and the named baseline are written to the
-  research journal before pre-registration. The baseline is registered under its own key, and the candidate is
-  derived as a child version, so it never replaces the baseline.
+- **Experiment design** (optional `experiment` in RESEARCH_REQUEST; mandatory when citing a learning candidate):
+  type, independent and dependent variable, controls, failure, stopping criteria and a design rationale, with
+  motivation and expected mechanism on the request. Candidate types run the full pipeline: SINGLE_VARIABLE
+  changes exactly one baseline parameter, INTERACTION changes two or more, and STRUCTURAL uses a different
+  *already-registered* strategy logic. Diagnostic types are pre-registered and use the development partition
+  only; they never produce a candidate. REGIME asks whether the baseline's OOS edge exists inside one
+  point-in-time regime label. EXECUTION applies a cost multiplier ≥ 1 or an entry delay: costs are stressed,
+  never reduced. RISK changes the backtest risk fraction; the live limits are untouched. The design and its
+  experiment id are written to the research journal before pre-registration. The baseline is registered under
+  its own key, and a candidate is derived as a child version.
+- **Research windows** (`_window`): the most recent contiguous stored run that overlaps no sealed holdout. A used
+  holdout is never re-evaluated, overlapped or folded into development data. Without enough unsealed data the
+  run ends NOT_RUN and says why.
+- **Candidate factory** (`ati/company/factory.py`): a lineage record per candidate: fingerprint, parent, baseline,
+  hypothesis, experiment id, datasets, params, code hash and provenance. Each candidate's evaluation trail is
+  derived from the journals only.
 - **Comparison** (`ati/company/objectives.py`): the baseline and the candidate are compared on the recorded
   development partition, dimension by dimension. Constraints come first, then evidence requirements. The
   strongest conclusion is IMPROVED_ON_DEVELOPMENT, and only the promotion gate can promote.
-- **Budget** (`ati/company/budget.py`) and **autonomy** (`ati/company/autonomy.py`): code-owned, derived from
-  journals; the ceiling is PAPER_AUTONOMY.
+- **Budget** (`ati/company/budget.py`): root hypotheses, variants per baseline, holdouts, runs and compute
+  units per day, datasets used, and idea saturation. Saturation means the same statement tested
+  `max_tests_per_idea` times ("another positive result would be unreliable"). **Autonomy**
+  (`ati/company/autonomy.py`): RESEARCH_AUTONOMY (no trade proposals) or PAPER_AUTONOMY; the live levels raise.
+- **Context identity**: each request carries `context_id` (a hash of the packet). The response must echo it, and
+  `action_started` records the request, the context, the strategy fingerprint and the dataset ids.
+- **Assumption monitors** (`ati/research/conditions.py`): each cycle records whether its research assumptions
+  still hold. A SHIFT becomes a learning outcome, at most one per assumption per day. It never becomes a rule.
+- **Readiness** (`ati company readiness`): read-only DATA / STRATEGY / RESEARCH / LEARNING / VALIDATION / RISK /
+  EXECUTION report. `ati company run` is the bounded scheduler entry point.
 - **Scorecard** (`ati/company/scorecard.py`): ten independent dimensions, each with its own state and no
   aggregate.
 - **DATA_CONFLICT** (`ati/market/conflict.py`): if two sources disagree, the conflict is recorded in

@@ -70,6 +70,7 @@ class TextEvidence:
         self.sources: dict[str, RawSource] = {}
         self.facts: list[ExtractedFact] = []
         self.interpretations: list[Interpretation] = []
+        self.hypotheses: list[dict] = []
 
     def add_source(self, src: RawSource) -> str:
         existing = self.sources.get(src.source_id)
@@ -94,6 +95,21 @@ class TextEvidence:
         if ensure_utc(interp.produced_at) < src.available_at:
             raise TextEvidenceError("interpretation predates its source's availability (look-ahead)")
         self.interpretations.append(interp)
+
+    def add_hypothesis(self, hypothesis_id: str, source_ids: list[str], as_of: datetime) -> dict:
+        """HYPOTHESIS layer: a research idea citing text sources. It records how many *independent* sources
+        support it (interpretations never add sources) and is only a candidate for a pre-registered
+        RESEARCH_REQUEST; text never becomes market evidence or a command."""
+        unknown = [sid for sid in source_ids if sid not in self.sources]
+        if unknown:
+            raise TextEvidenceError(f"hypothesis cites unknown sources {unknown}")
+        n = self.independent_sources(source_ids, as_of)
+        if n == 0:
+            raise TextEvidenceError("hypothesis cites no source available at its time (look-ahead)")
+        row = {"hypothesis_id": hypothesis_id, "layer": "HYPOTHESIS", "source_ids": sorted(set(source_ids)),
+               "independent_sources": n, "as_of": ensure_utc(as_of).isoformat()}
+        self.hypotheses.append(row)
+        return row
 
     def independent_sources(self, source_ids: list[str], as_of: datetime) -> int:
         """Distinct source ids available at ``as_of``. Many interpretations of one article are one source."""

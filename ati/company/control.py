@@ -25,6 +25,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
+from decimal import Decimal
 from enum import Enum
 
 from ati.agent.loop import AutonomousLoop, TickReport
@@ -33,23 +34,25 @@ from ati.agent.reasoning import ReasoningBudgetExceeded, ReasoningPending
 from ati.agent.roles import COMPANY, build_prompt
 from ati.agent.schema import (COMPANY_ACTIONS, CompanyAction, CompanyContext, ValidationContext,
                               parse_company_response)
-from ati.company import autonomy, budget, objectives, scorecard
+from ati.company import autonomy, budget, factory, objectives, scorecard
 from ati.company.health import HealthReport, Status, assess
 from ati.company.learning import LearningLedger
 from ati.core.canonical import sha256_hex, sha256_text
-from ati.core.errors import AtiError, CompanyStateError, SchemaViolation
+from ati.core.errors import AtiError, CompanyStateError, HoldoutViolation, SchemaViolation
 from ati.core.types import Side
-from ati.data.dataset import Dataset, Partition
+from ati.data.dataset import Dataset, Partition, sealed_ranges
 from ati.decision.records import make_decision_id
 from ati.ledger.journal import Journal, decode
 from ati.market.conflict import ConflictRegister
 from ati.memory.store import MemoryKind
+from ati.research import conditions as conditions_mod
+from ati.research import diagnostics
 from ati.research import protocol as P
 from ati.research.adversarial import AdversarialPolicy
-from ati.research.hypothesis import Criterion, ResearchLog
-from ati.research.metrics import Metrics
+from ati.research.hypothesis import Criterion, PreRegistration, ResearchLog
 from ati.research.walkforward import walk_forward
 from ati.research.workflow import run_research_cycle
+from ati.strategies.base import StrategyDefinition
 from ati.validation.promotion import PromotionPolicy
 
 
@@ -75,7 +78,8 @@ RESUME_ACK = "OPERATOR: company state reviewed; resume autonomous activity"
 _EPOCH = datetime(2024, 1, 1, tzinfo=timezone.utc)
 PROTOCOLS = {P.PROTOCOL_ID: P.base_definition(_EPOCH).key}
 PROTOCOL_PARAMS = {P.PROTOCOL_ID: dict(P.BASE_PARAMS)}
-EXECUTABLE_EXPERIMENTS = frozenset({"SINGLE_VARIABLE", "INTERACTION"})   # others: executor NOT IMPLEMENTED
+CANDIDATE_EXPERIMENTS = frozenset({"SINGLE_VARIABLE", "INTERACTION", "STRUCTURAL"})  # full pipeline → challenger
+DIAGNOSTIC_EXPERIMENTS = frozenset({"REGIME", "EXECUTION", "RISK"})                     # development-only, no candidate
 
 
 @dataclass
@@ -98,9 +102,10 @@ class CycleOutcome:
 
 class CompanyControlPlane:
     def __init__(self, system, *, loop: AutonomousLoop | None = None,
-                 research_policies: tuple[AdversarialPolicy, PromotionPolicy] | None = None):
+                 research_policies: tuple[AdversarialPolicy, PromotionPolicy] | None = None,
+                 autonomy_level: autonomy.Autonomy = autonomy.Autonomy.PAPER_AUTONOMY):
         s = system
-        self.autonomy = autonomy.require(autonomy.Autonomy.PAPER_AUTONOMY)   # the ceiling is code, not config
+        self.autonomy = autonomy.require(autonomy_level)   # the ceiling is code, not config: live levels raise
         self.s = s
         self.loop = loop or AutonomousLoop(s)
         self.research_policies = research_policies or (AdversarialPolicy(), PromotionPolicy())
@@ -196,7 +201,8 @@ class CompanyControlPlane:
                 cand = self.loop.manage_position(report, symbol, ds, marks, champion)
                 if cand is not None:
                     candidates[symbol] = cand
-        health = assess(s, self.loop, datasets, self.journal, self.paused, self.conflicts)
+        health = assess(s, self.loop, datasets, self.journal, self.paused, self.conflicts,
+                        extra_journals=(self.learning.journal, self.conflicts.journal))
         fingerprint = self._fingerprint(datasets, health)
 
         if self.running is not None:                                   # RECOVER
@@ -213,15 +219,23 @@ class CompanyControlPlane:
                                     {"recorded_status": done.status}, health.as_dict())
             self._transition(CompanyState.RUNNING, f"cycle {cycle_id}")
             self.journal.append("cycle_start", {"cycle_id": cycle_id, "fingerprint": fingerprint,
-                                                "paused": self.paused})
+                                                "paused": self.paused, "autonomy": self.autonomy.name})
             cyc = self.cycles[cycle_id] = CycleRecord(cycle_id, fingerprint)
             self.running = cycle_id
 
         if "health" not in cyc.steps:
             self._step(cyc, "health", health.as_dict())
-        allowed = [a for a in COMPANY_ACTIONS if not health.gate(a, self.paused)]
+        conditions = self._conditions(datasets)
+        if "conditions" not in cyc.steps:
+            self._step(cyc, "conditions", {"monitors": [{k: c[k] for k in ("assumption", "status", "statistic")}
+                                                        for c in conditions]})
+        allowed = [a for a in COMPANY_ACTIONS if not self._gate(a, health)]
         request_id = f"{cyc.cycle_id}:company"
-        packet = self._context(cyc, request_id, health, datasets, candidates, marks, allowed)
+        packet = self._context(cyc, request_id, health, datasets, candidates, marks, allowed, conditions)
+        # Context identity: the hash of exactly what Claude is shown. Once issued it is fixed for this cycle, so a
+        # response can only ever be bound to the context it was produced from.
+        issued = cyc.steps.get("request_issued", {}).get("context_id")
+        packet["context_id"] = issued or "ctx_" + sha256_hex(packet)[:24]
         prompt = build_prompt(COMPANY, packet, None, s.guard)
 
         # CLAUDE_ACTION — the response is read, hashed and bound to this request before anything else.
@@ -244,7 +258,7 @@ class CompanyControlPlane:
 
         # VALIDATE_ACTION — closed schema, then the deterministic health gate.
         try:
-            action = parse_company_response(raw, self._contract(cyc, request_id, health, datasets))
+            action = parse_company_response(raw, self._contract(cyc, request_id, health, datasets, packet["context_id"]))
         except SchemaViolation as exc:
             if "rejected" not in cyc.steps:
                 self._step(cyc, "rejected", {"reason": str(exc)[:500]})
@@ -252,7 +266,7 @@ class CompanyControlPlane:
         if "action_result" in cyc.steps:   # crashed after recording the result: finish, never re-execute
             recorded = dict(cyc.steps["action_result"])
             return self._finish(cyc, recorded.pop("status"), action.action, recorded, health)
-        reasons = health.gate(action.action, self.paused)   # re-applied on recovery too: never looser
+        reasons = self._gate(action.action, health)   # re-applied on recovery too: never looser
         if reasons:
             note = {"note": "blocked on recovery; downstream journals are authoritative for anything already done"} \
                 if "action_started" in cyc.steps else {}
@@ -262,7 +276,10 @@ class CompanyControlPlane:
 
         # EXECUTE_ALLOWED_ACTION — only through existing systems.
         if "action_started" not in cyc.steps:
-            started = {"action": action.action}
+            champion = s.strategies.champion()
+            started = {"action": action.action, "request_id": request_id, "context_id": packet["context_id"],
+                       "strategy_fingerprint": champion.definition_hash if champion else None,
+                       "datasets": {sym: ds.dataset_id for sym, ds in sorted(datasets.items())}}
             if action.trade is not None and action.symbol in candidates:
                 started["cutoff"] = candidates[action.symbol][0].cutoff
             self._step(cyc, "action_started", started)
@@ -368,16 +385,13 @@ class CompanyControlPlane:
         if log.status(spec.hypothesis_id) != "UNKNOWN":
             if "research_invoked" in cyc.steps:  # this cycle already ran it before a crash: report, never rerun
                 detail = {"hypothesis_id": spec.hypothesis_id, "research_status": log.status(spec.hypothesis_id),
-                          "recovered": True}
-                if exp is not None and exp.candidate_params is not None:
+                          "recovered": True, "experiment_id": cyc.steps["research_invoked"].get("experiment_id")}
+                if exp is not None and exp.type in CANDIDATE_EXPERIMENTS:
                     detail["comparison"] = self._compare(spec, base, log)
                 self._link(spec)
                 return "COMPLETED", detail
             return "BLOCKED", {"reason": f"{spec.hypothesis_id} is already registered ({log.status(spec.hypothesis_id)}); "
                                          "criteria are locked — a new question needs a new hypothesis id"}
-        if exp is not None and exp.type not in EXECUTABLE_EXPERIMENTS:
-            return "BLOCKED", {"reason": f"{exp.type} experiment executor is NOT IMPLEMENTED; nothing was run or "
-                                         "approximated"}
         lc = spec.learning_candidate_id
         if lc is not None:
             cand = self.learning.candidates.get(lc)
@@ -389,12 +403,33 @@ class CompanyControlPlane:
             if not cand.research_eligible:
                 return "BLOCKED", {"reason": f"{lc} is {cand.state.value} with {len(cand.evidence)} outcome(s): "
                                              "not eligible for a hypothesis"}
+        # The candidate definition (if any) — only from already-registered strategy logic, never new code.
+        candidate_def, grid = None, P.GRID
+        if exp is not None and exp.candidate_params is not None:
+            grid = [dict(exp.candidate_params)]
+        elif exp is not None and exp.structure is not None:
+            kind, params = exp.structure
+            if kind == base.kind:
+                return "BLOCKED", {"reason": "STRUCTURAL experiments use a different strategy logic than the baseline"}
+            try:
+                candidate_def = StrategyDefinition.create(kind, 1, kind, dict(params), P.TIMEFRAME, s.clock.now(),
+                                                          description=f"structural candidate for {spec.hypothesis_id}")
+            except (KeyError, ValueError, TypeError) as exc:
+                return "BLOCKED", {"reason": f"STRUCTURAL candidate invalid (only registered strategy logic may be "
+                                             f"used): {exc}"[:300]}
+            grid = [candidate_def.param_dict]
+        diagnostic = exp is not None and exp.type in DIAGNOSTIC_EXPERIMENTS
         registered = self._registered(base)
-        grid = [dict(exp.candidate_params)] if exp is not None and exp.candidate_params is not None else P.GRID
-        new_variant = any(self._registered_with(base, g) is None for g in grid if g != dict(P.BASE_PARAMS))
+        series = s.store.series(s.provider.name, P.SYMBOL, P.TIMEFRAME)
+        window = self._window(series, diagnostic)
+        dev_bars = window[2] if isinstance(window, tuple) else 0
+        compute = dev_bars * (len(grid) + (1 if exp is not None else 0)) if exp is not None else 0
+        new_variant = candidate_def is None and not diagnostic and any(
+            self._registered_with(base, g) is None for g in grid if g != dict(P.BASE_PARAMS))
         if "research_invoked" not in cyc.steps:
-            u = budget.usage(s, self.journal, s.clock.now(), registered.definition_hash if registered else None)
-            over = budget.check(u, new_variant)
+            u = budget.usage(s, self.journal, s.clock.now(), registered.definition_hash if registered else None,
+                             statement=spec.statement)
+            over = budget.check(u, new_variant, compute)
             if over:
                 return "BLOCKED", {"reason": "research budget: " + "; ".join(over), "budget_policy": u["policy_hash"]}
         criteria = list(P.CRITERIA)  # the protocol's floor is always included: requests can only add criteria
@@ -402,45 +437,139 @@ class CompanyControlPlane:
             c = Criterion(metric, op, threshold)
             if c not in criteria:
                 criteria.append(c)
-        series = s.store.series(s.provider.name, P.SYMBOL, P.TIMEFRAME)
+        design = self._design(spec, base, registered, criteria, candidate_def, compute) if exp is not None else None
+        exp_id = factory.experiment_id(spec.hypothesis_id, sha256_hex(design) if design else "protocol-default")
         if "research_invoked" not in cyc.steps:
-            self._step(cyc, "research_invoked", {"hypothesis_id": spec.hypothesis_id, "criteria": len(criteria)})
-        if not series:
-            return "COMPLETED", {"hypothesis_id": spec.hypothesis_id, "research_status": "NOT_RUN",
-                                 "reasons": ["no stored data for the protocol symbol"]}
+            self._step(cyc, "research_invoked", {"hypothesis_id": spec.hypothesis_id, "criteria": len(criteria),
+                                                 "experiment_id": exp_id,
+                                                 "experiment_type": exp.type if exp else "PROTOCOL_GRID"})
+        if window is None or isinstance(window, str):
+            reason = window or "no stored data for the protocol symbol"
+            s.research_journal.append("research_not_run", {"hypothesis_id": spec.hypothesis_id, "reasons": [reason]})
+            return "COMPLETED", {"hypothesis_id": spec.hypothesis_id, "research_status": "NOT_RUN", "reasons": [reason],
+                                 "experiment_id": exp_id}
+        full, boundary, _ = window
         if exp is not None:
             # Baseline discipline: the baseline definition is registered under its own key *before* the run, so
-            # the candidate is derived as a new version with the baseline as parent — never stored as the baseline.
+            # a candidate is derived as a new version with the baseline as parent — never stored as the baseline.
             registered = registered or s.strategies.register(base)
-            # Design recorded before the run: the baseline is named explicitly and never silently replaced.
-            s.research_journal.append("experiment_design", {
-                "hypothesis_id": spec.hypothesis_id, "type": exp.type,
-                "independent_variables": list(exp.independent_variables), "dependent_variable": exp.dependent_variable,
-                "controls": exp.controls, "failure_criteria": exp.failure_criteria,
-                "stopping_criteria": exp.stopping_criteria, "success_criteria": [[c.metric, c.op, c.threshold]
-                                                                                 for c in criteria],
-                "baseline": {"strategy_key": base.key, "params": dict(P.BASE_PARAMS),
-                             "fingerprint": registered.definition_hash if registered else None},
-                "candidate_params": dict(exp.candidate_params) if exp.candidate_params else None,
-                "motivation": spec.motivation, "expected_mechanism": spec.expected_mechanism,
-                "evidence_refs": list(spec.evidence_refs), "learning_candidate_id": lc,
-                "objective_contract": objectives.CONTRACT.contract_hash, "budget_policy": budget.POLICY.policy_hash})
-        full = Dataset.build(series, data_version="company-store",
-                             realization=getattr(s.provider, "realization", "observed"))
-        boundary = full.candles[int(len(full) * (1 - P.HOLDOUT_FRACTION))].open_time
+            design["baseline"]["fingerprint"] = registered.definition_hash
+            # Design recorded before any pre-registration or test.
+            s.research_journal.append("experiment_design", design | {"experiment_id": exp_id,
+                                                                     "dataset_id": full.dataset_id})
+        if diagnostic:
+            detail = self._diagnostic(spec, exp, base, full, boundary, criteria)
+            self._link(spec)
+            return "COMPLETED", detail | {"experiment_id": exp_id}
         adversarial, promotion = self.research_policies
         r = run_research_cycle(s, full, boundary, hypothesis_id=spec.hypothesis_id, statement=spec.statement,
-                               base=base, grid=grid, criteria=tuple(criteria),
+                               base=candidate_def or base, grid=grid, criteria=tuple(criteria),
                                train_bars=P.TRAIN_BARS, test_bars=P.TEST_BARS, adversarial_policy=adversarial,
                                promotion_policy=promotion, min_candles=P.MIN_CANDLES)
-        detail = {"hypothesis_id": spec.hypothesis_id, "research_status": r.status,
+        detail = {"hypothesis_id": spec.hypothesis_id, "experiment_id": exp_id, "research_status": r.status,
                   "reasons": list(r.reasons), "dev_verdict": r.dev_verdict and r.dev_verdict.value,
                   "holdout_verdict": r.holdout_verdict and r.holdout_verdict.value,
-                  "promotion_approved": r.promotion.approved if r.promotion else None}
-        if exp is not None and exp.candidate_params is not None and r.dev_verdict is not None:
+                  "promotion_approved": r.promotion.approved if r.promotion else None,
+                  "research_window": {"dataset_id": full.dataset_id, "bars": len(full)}}
+        if r.challenger_key:
+            challenger = s.strategies.get(r.challenger_key)
+            dev_id = next((e["dataset_id"] for e in ResearchLog(s.research_journal).experiments
+                           if e["hypothesis_id"] == spec.hypothesis_id and e["stage"] == "walk_forward_oos"), None)
+            factory.record_lineage(s, challenger, hypothesis_id=spec.hypothesis_id, experiment_id=exp_id,
+                                   dev_dataset_id=dev_id, full_dataset_id=full.dataset_id,
+                                   baseline_hash=registered.definition_hash if registered else None)
+            detail["candidate"] = {"key": challenger.key, "fingerprint": challenger.definition_hash,
+                                   "parent_fingerprint": challenger.parent_hash}
+        if exp is not None and exp.type in CANDIDATE_EXPERIMENTS and r.dev_verdict is not None:
             detail["comparison"] = self._compare(spec, base, ResearchLog(s.research_journal), full, boundary)
         self._link(spec)
         return "COMPLETED", detail
+
+    def _window(self, series, diagnostic: bool):
+        """Deterministic research window: the most recent contiguous run of stored bars that overlaps no sealed
+        holdout period. A holdout that has been used is never reused, overlapped, or folded into development data.
+        Returns (full, boundary, dev_bars), or a NOT_RUN reason string, or None when nothing is stored."""
+        if not series:
+            return None
+        first = series[0]
+        sealed = sealed_ranges(first.provider, first.symbol, first.timeframe,
+                               getattr(self.s.provider, "realization", "observed"))
+        segments, current = [], []
+        for c in series:
+            if any(c.open_time < end and c.close_time > start for start, end in sealed):
+                if current:
+                    segments.append(current)
+                current = []
+            else:
+                current.append(c)
+        if current:
+            segments.append(current)
+        need = int(P.MIN_CANDLES * (1 - P.HOLDOUT_FRACTION)) if diagnostic else P.MIN_CANDLES
+        latest = segments[-1] if segments else []
+        if len(latest) < need:
+            return (f"INSUFFICIENT DATA outside sealed holdout periods: latest unsealed run has {len(latest)} bars "
+                    f"< {need} required ({len(sealed)} holdout period(s) already used)")
+        full = Dataset.build(latest, data_version="company-store",
+                             realization=getattr(self.s.provider, "realization", "observed"))
+        boundary = full.candles[int(len(full) * (1 - P.HOLDOUT_FRACTION))].open_time
+        dev_bars = sum(1 for c in full.candles if c.close_time <= boundary)
+        return full, boundary, dev_bars
+
+    def _design(self, spec, base, registered, criteria, candidate_def, compute) -> dict:
+        exp = spec.experiment
+        candidate = None
+        if exp.candidate_params is not None:
+            candidate = {"strategy_id": base.strategy_id, "kind": base.kind, "params": dict(exp.candidate_params)}
+        elif candidate_def is not None:
+            candidate = {"strategy_id": candidate_def.strategy_id, "kind": candidate_def.kind,
+                         "params": candidate_def.param_dict, "code_hash": candidate_def.code_hash}
+        return {"hypothesis_id": spec.hypothesis_id, "type": exp.type, "design_rationale": exp.design_rationale,
+                "independent_variables": list(exp.independent_variables), "dependent_variable": exp.dependent_variable,
+                "controls": exp.controls, "failure_criteria": exp.failure_criteria,
+                "stopping_criteria": exp.stopping_criteria,
+                "success_criteria": [[c.metric, c.op, c.threshold] for c in criteria],
+                "baseline": {"strategy_key": base.key, "params": dict(P.BASE_PARAMS),
+                             "fingerprint": registered.definition_hash if registered else None},
+                "candidate": candidate, "condition": dict(exp.condition) if exp.condition else None,
+                "motivation": spec.motivation, "expected_mechanism": spec.expected_mechanism,
+                "evidence_refs": list(spec.evidence_refs), "learning_candidate_id": spec.learning_candidate_id,
+                "compute_units": compute, "objective_contract": objectives.CONTRACT.contract_hash,
+                "budget_policy": budget.POLICY.policy_hash}
+
+    def _diagnostic(self, spec, exp, base, full, boundary, criteria) -> dict:
+        """REGIME / EXECUTION / RISK: pre-registered, development partition only, recorded like any experiment,
+        and never a candidate: no challenger, no holdout, no promotion."""
+        s = self.s
+        dev = Dataset.build([c for c in full.candles if c.close_time <= boundary], data_version=full.identity.data_version,
+                            realization=full.identity.realization, partition=Partition.DEVELOPMENT)
+        log = ResearchLog(s.research_journal)
+        prereg = PreRegistration(spec.hypothesis_id, spec.statement, tuple(spec.evidence_refs), base.key,
+                                 base.definition_hash, dev.dataset_id, tuple(criteria),
+                                 self.research_policies[0].min_oos_trades, s.clock.now())
+        log.preregister(prereg)
+        cond = dict(exp.condition)
+        runner = {"REGIME": lambda: diagnostics.regime(base, dev, cond["regime"], train_bars=P.TRAIN_BARS,
+                                                       test_bars=P.TEST_BARS),
+                  "EXECUTION": lambda: diagnostics.execution(base, dev, cond, train_bars=P.TRAIN_BARS,
+                                                             test_bars=P.TEST_BARS),
+                  "RISK": lambda: diagnostics.risk(base, dev, cond, train_bars=P.TRAIN_BARS, test_bars=P.TEST_BARS)}
+        try:
+            metrics, evidence_hash, facts = runner[exp.type]()
+        except (ValueError, HoldoutViolation) as exc:
+            s.research_journal.append("research_note", {"hypothesis_id": spec.hypothesis_id,
+                                                        "note": f"diagnostic not run: {exc}"[:300]})
+            return {"hypothesis_id": spec.hypothesis_id, "research_status": "NOT_RUN", "reasons": [str(exc)[:300]]}
+        s.evidence.register("experiment", evidence_hash + ":" + spec.hypothesis_id, s.clock.now(),
+                            f"{exp.type} diagnostic on {dev.dataset_id}", dataset_id=dev.dataset_id,
+                            strategy=base.definition_hash)
+        verdict = log.record_experiment(spec.hypothesis_id, f"diagnostic:{exp.type.lower()}", evidence_hash, metrics,
+                                        dev.dataset_id)
+        s.research_journal.append("diagnostic_result", {"hypothesis_id": spec.hypothesis_id, "type": exp.type,
+                                                        "facts": facts, "verdict": verdict.value,
+                                                        "note": "development-only: never validation, never a candidate"})
+        return {"hypothesis_id": spec.hypothesis_id, "research_status": "COMPLETED", "dev_verdict": verdict.value,
+                "holdout_verdict": None, "promotion_approved": None, "diagnostic": facts,
+                "n_trades": metrics.n_trades, "expectancy_r": metrics.expectancy_r}
 
     def _link(self, spec) -> None:
         if spec.learning_candidate_id is not None:
@@ -461,28 +590,37 @@ class CompanyControlPlane:
         return None
 
     def _compare(self, spec, base, log: ResearchLog, full: Dataset | None = None, boundary=None) -> dict:
-        """Baseline vs candidate on the *recorded* development partition only (never the holdout). Written once
-        per hypothesis to the research journal; the objective contract decides the conclusion, not Claude."""
+        """BASELINE_* vs CANDIDATE_* on the *recorded* development partition only (never the holdout). Written once
+        per hypothesis; the objective contract decides the conclusion, not Claude. The candidate's walk-forward is
+        recomputed and must reproduce the recorded evidence hash."""
         s = self.s
         existing = next((decode(e.payload) for e in s.research_journal.entries("experiment_comparison")
                          if e.payload["hypothesis_id"] == spec.hypothesis_id), None)
         if existing is not None:
             return {"conclusion": existing["conclusion"], "recorded": True}
+        design = next((decode(e.payload) for e in s.research_journal.entries("experiment_design")
+                       if e.payload["hypothesis_id"] == spec.hypothesis_id), None)
         rows = [e for e in log.experiments if e["hypothesis_id"] == spec.hypothesis_id and e["stage"] == "walk_forward_oos"]
-        if not rows:
-            return {"conclusion": "NOT_AVAILABLE", "reason": "no development experiment recorded"}
+        if not rows or design is None or design.get("candidate") is None:
+            return {"conclusion": "NOT_AVAILABLE", "reason": "no development experiment or design recorded"}
         row = rows[-1]
         if full is None:
-            series = s.store.series(s.provider.name, P.SYMBOL, P.TIMEFRAME)
-            full = Dataset.build(series, data_version="company-store",
-                                 realization=getattr(s.provider, "realization", "observed"))
-            boundary = full.candles[int(len(full) * (1 - P.HOLDOUT_FRACTION))].open_time
+            window = self._window(s.store.series(s.provider.name, P.SYMBOL, P.TIMEFRAME), False)
+            candidates = [w for w in [window] if isinstance(w, tuple) and w[0].dataset_id == design.get("dataset_id")]
+            if not candidates:
+                return {"conclusion": "NOT_AVAILABLE", "reason": "research window changed; comparison not reconstructable"}
+            full, boundary, _ = candidates[0]
         dev = Dataset.build([c for c in full.candles if c.close_time <= boundary], data_version=full.identity.data_version,
                             realization=full.identity.realization, partition=Partition.DEVELOPMENT)
         if dev.dataset_id != row["dataset_id"]:
             return {"conclusion": "NOT_AVAILABLE", "reason": "development partition does not match the recorded experiment"}
+        cd = design["candidate"]
+        cand_base = base if cd["strategy_id"] == base.strategy_id else StrategyDefinition.create(
+            cd["strategy_id"], 1, cd["kind"], cd["params"], P.TIMEFRAME, s.clock.now())
+        cand_wf = walk_forward(cand_base, dev, [cd["params"]], train_bars=P.TRAIN_BARS, test_bars=P.TEST_BARS)
+        if cand_wf.evidence_hash != row["evidence_hash"]:
+            return {"conclusion": "NOT_AVAILABLE", "reason": "candidate walk-forward does not reproduce the recorded evidence"}
         baseline = walk_forward(base, dev, [dict(P.BASE_PARAMS)], train_bars=P.TRAIN_BARS, test_bars=P.TEST_BARS)
-        candidate = Metrics(**row["metrics"])
         stages = {e["stage"]: e["verdict"] for e in log.experiments
                   if e["hypothesis_id"] in (spec.hypothesis_id, spec.hypothesis_id + ":holdout")}
         adv = [decode(e.payload)["report"] for e in s.research_journal.entries("adversarial_report")]
@@ -493,12 +631,18 @@ class CompanyControlPlane:
         if mine and stages.get("holdout") is not None:
             blocking = any(o["verdict"] in ("FAIL", "INSUFFICIENT_EVIDENCE") for o in mine[-1]["objections"])
             verdicts["adversarial"] = "BLOCKING" if blocking else "NON_BLOCKING"
-        result = objectives.compare(baseline.oos_metrics, candidate, verdicts)
+        extra = {"wfo_stability": (baseline.positive_fold_fraction, cand_wf.positive_fold_fraction)}
+        result = objectives.compare(baseline.oos_metrics, cand_wf.oos_metrics, verdicts, extra=extra)
         s.research_journal.append("experiment_comparison", {
-            "hypothesis_id": spec.hypothesis_id, "dev_dataset_id": dev.dataset_id,
-            "baseline": {"strategy_key": base.key, "params": dict(P.BASE_PARAMS), "evidence_hash": baseline.evidence_hash},
-            "candidate": {"params": dict(spec.experiment.candidate_params), "evidence_hash": row["evidence_hash"]},
-            "verdicts": verdicts, **result})
+            "hypothesis_id": spec.hypothesis_id, "experiment_id": design.get("experiment_id"),
+            "baseline_strategy": base.key, "baseline_fingerprint": design["baseline"]["fingerprint"],
+            "baseline_dataset": dev.dataset_id, "baseline_results": baseline.oos_metrics,
+            "baseline_evidence": baseline.evidence_hash,
+            "candidate_strategy": f"{cd['strategy_id']}:{sorted(cd['params'].items())}",
+            "candidate_fingerprint": challenger_hash, "candidate_dataset": dev.dataset_id,
+            "candidate_results": cand_wf.oos_metrics, "candidate_evidence": row["evidence_hash"],
+            "dev_dataset_id": dev.dataset_id, "verdicts": verdicts, **result,
+            "baseline_replaced": False})
         return {"conclusion": result["conclusion"], "dimensions": result["dimensions"],
                 "constraint_violations": result["constraint_violations"][:4], "recorded": False}
 
@@ -506,6 +650,7 @@ class CompanyControlPlane:
     def _issue(self, cyc, request_id, prompt, packet, allowed) -> None:
         # What was provided is recorded by category and hash — not a second copy of the context.
         self._step(cyc, "request_issued", {"request_id": request_id, "request_sha256": sha256_text(prompt),
+                                           "context_id": packet["context_id"], "issued_at": self.s.clock.now(),
                                            "context_categories": sorted(packet), "allowed_actions": allowed})
 
     def _finish(self, cyc: CycleRecord, status: str, action: str | None, detail: dict,
@@ -549,7 +694,26 @@ class CompanyControlPlane:
             "pause_epoch": self.pause_epoch, "stops": sorted(self.loop.stops),
         })
 
-    def _contract(self, cyc, request_id, health: HealthReport, datasets) -> CompanyContext:
+    def _gate(self, action: str, health: HealthReport) -> list[str]:
+        reasons = health.gate(action, self.paused)
+        if action == "TRADE_PROPOSAL" and self.autonomy < autonomy.Autonomy.PAPER_AUTONOMY:
+            reasons = reasons + [f"autonomy {self.autonomy.name} does not include paper trading"]
+        return reasons
+
+    def _conditions(self, datasets) -> list[dict]:
+        """Assumption monitors on the point-in-time data refreshed this cycle, plus realized paper entry costs."""
+        s = self.s
+        fills = []
+        ctx = {e.payload["decision_id"]: dict(decode(e.payload)["record"]["market_context"])
+               for e in s.decisions.journal.entries("decision")}
+        for o in s.execution.orders.values():
+            ref = ctx.get(o.decision_id, {}).get("last_price")
+            if o.side is Side.BUY and o.filled_qty > 0 and ref is not None and o.avg_fill_price is not None:
+                fills.append((Decimal(ref), o.avg_fill_price, o.filled_qty))
+        return conditions_mod.monitor({sym: ds.candles for sym, ds in datasets.items()}, fills,
+                                      s.costs.half_spread_rate + s.costs.slippage_rate)
+
+    def _contract(self, cyc, request_id, health: HealthReport, datasets, context_id: str = "") -> CompanyContext:
         s = self.s
         champion = s.strategies.champion()
         now = s.clock.now()
@@ -558,7 +722,7 @@ class CompanyControlPlane:
             last_prices={sym: ds.candles[-1].close for sym, ds in datasets.items()},
             evidence_exists=lambda r: r in s.evidence and s.evidence.resolve(r).available_at <= now,
             account_state_known=health.status("execution") is Status.PASS)
-        return CompanyContext(request_id, cyc.cycle_id, trade, PROTOCOLS, PROTOCOL_PARAMS,
+        return CompanyContext(request_id, cyc.cycle_id, trade, PROTOCOLS, PROTOCOL_PARAMS, context_id,
                               lambda r: s.evidence.resolve(r).kind if r in s.evidence else None)
 
     def _positions(self, marks, symbol=None) -> list[dict]:
@@ -587,7 +751,7 @@ class CompanyControlPlane:
             view["portfolio"] = "marks unavailable (no fresh data): equity not computed"
         return view
 
-    def _context(self, cyc, request_id, health, datasets, candidates, marks, allowed) -> dict:
+    def _context(self, cyc, request_id, health, datasets, candidates, marks, allowed, conditions=()) -> dict:
         """Bounded, point-in-time context: summaries only — no journals, datasets, holdout or internals."""
         s = self.s
         champion = s.strategies.champion()
@@ -608,6 +772,9 @@ class CompanyControlPlane:
                      "reconciliation": s.execution.recon_state.value,
                      "max_risk_per_trade_fraction": str(s.limits.max_risk_per_trade_fraction)},
             "strategy": {"champion": champion.key if champion else None,
+                         "fingerprint": champion.definition_hash if champion else None,
+                         "version": champion.version if champion else None,
+                         "params": champion.param_dict if champion else None,
                          "entry_signals": {sym: {"cutoff": str(c[0].cutoff), "last_close": str(c[0].latest.close)}
                                            for sym, c in sorted(candidates.items())}},
             "research": {"hypotheses_tested": log.hypotheses_tested if log else "UNAVAILABLE (research FAIL)",
@@ -634,9 +801,40 @@ class CompanyControlPlane:
                                    for e in (log.experiments if log else []) if e["verdict"] != "PASS"][-8:],
             "validated_findings": [{"statement": m.statement, "confidence": m.confidence}
                                    for m in s.memory.query(s.clock.now()) if m.kind is MemoryKind.VALIDATED_FINDING][-5:],
-            "experiment_protocol": {"types_executable": sorted(EXECUTABLE_EXPERIMENTS),
+            "conditions": [{k: c[k] for k in ("assumption", "status", "statistic", "invalidates")} for c in conditions],
+            "recent_outcomes": [{"source": o.source, "at": o.at, "realized": o.realized, "deviation": o.deviation}
+                                for o in list(self.learning.outcomes.values())[-6:]],
+            "active_hypotheses": self._active_hypotheses(log),
+            "validation": self._validation_status(),
+            "experiment_protocol": {"candidate_types": sorted(CANDIDATE_EXPERIMENTS),
+                                    "diagnostic_types": sorted(DIAGNOSTIC_EXPERIMENTS),
+                                    "regime_labels": list(diagnostics.REGIME_LABELS),
+                                    "execution_bounds": diagnostics.EXECUTION_BOUNDS,
+                                    "risk_bounds": diagnostics.RISK_BOUNDS,
                                     "baseline_params": PROTOCOL_PARAMS[P.PROTOCOL_ID]},
         }
+
+    def _active_hypotheses(self, log) -> list[dict]:
+        if log is None:
+            return []
+        tested = {e["hypothesis_id"] for e in log.experiments}
+        linked = {c.hypothesis_id: c.candidate_id for c in self.learning.candidates.values() if c.hypothesis_id}
+        out = []
+        for e in self.s.research_journal.entries("preregistration"):
+            h = e.payload["prereg"]["hypothesis_id"]
+            if ":" not in h:
+                out.append({"hypothesis_id": h, "status": log.status(h), "learning_candidate": linked.get(h),
+                            "tested": h in tested})
+        return out[-8:]
+
+    def _validation_status(self) -> dict:
+        s = self.s
+        promos = [decode(e.payload)["record"] for e in s.research_journal.entries("promotion_decision")]
+        latest = promos[-1] if promos else None
+        return {"latest_promotion": {"challenger": latest["challenger_key"], "approved": latest["approved"],
+                                     "reasons": list(latest["reasons"])[:3]} if latest else "NOT_AVAILABLE",
+                "candidates": [factory.stages(s, e.payload["fingerprint"])["furthest_stage"]
+                               for e in s.research_journal.entries("candidate_lineage")][-5:]}
 
     def _budget_view(self) -> dict:
         s = self.s

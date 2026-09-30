@@ -21,6 +21,7 @@ Data availability is classified into exactly one ``DataState``:
 
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass
 from enum import Enum
 
@@ -52,7 +53,7 @@ class DataState(str, Enum):
     INVALID_DATA = "INVALID_DATA"
 
 
-COMPONENTS = ("data", "research", "memory", "risk", "execution", "ledger", "company")
+COMPONENTS = ("data", "research", "memory", "risk", "execution", "ledger", "persistence", "company")
 
 
 @dataclass(frozen=True)
@@ -85,10 +86,10 @@ class HealthReport:
         if paused:
             reasons.append("company is PAUSED: only read-only actions and PAUSE are allowed")
         if action == "TRADE_PROPOSAL":
-            needed = ("data", "memory", "risk", "execution", "ledger")
+            needed = ("data", "memory", "risk", "execution", "ledger", "persistence")
             ok_data = {DataState.REAL_DATA_AVAILABLE, DataState.MOCK_DATA_ONLY}
         elif action == "RESEARCH_REQUEST":
-            needed = ("data", "research", "memory", "ledger")
+            needed = ("data", "research", "memory", "ledger", "persistence")
             ok_data = {DataState.REAL_DATA_AVAILABLE, DataState.MOCK_DATA_ONLY}
         else:
             return [f"unknown action {action!r}"]
@@ -109,7 +110,8 @@ def _journal_ok(journal: Journal) -> str | None:
         return f"{type(exc).__name__}: {exc}"
 
 
-def assess(system, loop, datasets: dict, company_journal: Journal, paused: bool, conflicts=None) -> HealthReport:
+def assess(system, loop, datasets: dict, company_journal: Journal, paused: bool, conflicts=None,
+           extra_journals: tuple = ()) -> HealthReport:
     s = system
     checks: list[Check] = []
 
@@ -208,6 +210,15 @@ def assess(system, loop, datasets: dict, company_journal: Journal, paused: bool,
     problem = _journal_ok(s.decisions.journal) or _journal_ok(ex.journal)
     checks.append(Check("ledger", Status.FAIL, problem[:300]) if problem else
                   Check("ledger", Status.PASS, f"{len(ex.account.positions)} position records; journals intact"))
+
+    # --- persistence (every other durable store: evidence, loop, learning, conflicts; state dir writable) ----
+    journals = [s.evidence.journal, getattr(loop, "journal", None), *extra_journals]
+    problem = next((f"{j.path.name}: {p}" for j in journals if j is not None for p in [_journal_ok(j)] if p), None)
+    if problem is None and not os.access(s.state_dir, os.W_OK):
+        problem = f"state directory {s.state_dir} is not writable"
+    checks.append(Check("persistence", Status.FAIL, problem[:300]) if problem else
+                  Check("persistence", Status.PASS, f"{sum(1 for j in journals if j is not None)} journals verify; "
+                                                    "state directory writable"))
 
     # --- company ------------------------------------------------------------------------------------
     problem = _journal_ok(company_journal)

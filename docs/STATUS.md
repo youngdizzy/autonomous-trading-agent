@@ -45,11 +45,19 @@ Vocabulary is exact. Nothing below is upgraded from one state to another.
 | Autonomous loop (resumable tick) | IMPLEMENTED |
 | Company control plane (Phase 1: closed actions, health gate, pause, recovery, idempotent cycles) | IMPLEMENTED (MOCK data and REAL-unavailable paths verified; REAL-available path untested — no REAL data) |
 | Outcome learning / LEARN stage (outcome records, deterministic detectors, learning candidates, evidence-quality ladder, holdout-derived isolation) | IMPLEMENTED (MOCK outcomes only; no candidate has market evidence) |
-| Experiment design contract (SINGLE_VARIABLE, INTERACTION executed; design + baseline recorded before the run; dev-only baseline/candidate comparison) | IMPLEMENTED |
-| STRUCTURAL / REGIME / EXECUTION / RISK experiment executors | NOT IMPLEMENTED (representable in the schema; the control plane BLOCKS them) |
+| Experiment design contract (all six types; design, rationale, baseline and experiment id recorded before pre-registration) | IMPLEMENTED |
+| SINGLE_VARIABLE / INTERACTION / STRUCTURAL candidate experiments (full WFO → adversarial/robustness → holdout → promotion gate) | IMPLEMENTED (STRUCTURAL limited to already-registered strategy logic; buy-and-hold cannot pass walk-forward selection) |
+| REGIME / EXECUTION / RISK diagnostic experiments (pre-registered, development partition only, never a candidate) | IMPLEMENTED |
+| Research windows that never reuse or overlap a used holdout | IMPLEMENTED |
+| Candidate lineage record + derived evaluation trail (HYPOTHESIS → … → PROMOTION_REVIEW) | IMPLEMENTED |
+| Idea saturation, compute and dataset-usage budgets | IMPLEMENTED |
+| Future-condition assumption monitors (volatility, trend/range, liquidity, distribution, structural break, correlation, execution cost) | IMPLEMENTED (correlation NOT_AVAILABLE with one symbol; execution cost NOT_AVAILABLE without paper fills) |
+| Read-only readiness report (`ati company readiness`) | IMPLEMENTED |
+| Scheduler entry point (`ati company run`, bounded, stops at the first cycle needing Claude) | IMPLEMENTED; no scheduler is configured |
+| End-to-end MOCK/PAPER company traversal (trade → outcome → learning → hypothesis → experiment → memory) | IMPLEMENTED — demonstrated in tests with a scripted MOCK Claude only |
 | Objective contract (constraints, failure conditions, evidence requirements; no single score) | IMPLEMENTED |
 | Research budget (hypotheses, variants per baseline, holdouts, runs per day — derived from journals) | IMPLEMENTED |
-| Autonomy levels (ceiling PAPER_AUTONOMY; SUPERVISED_LIVE / FULL_LIVE impossible) | IMPLEMENTED |
+| Autonomy levels (RESEARCH_AUTONOMY and PAPER_AUTONOMY selectable; SUPERVISED_LIVE / FULL_LIVE impossible) | IMPLEMENTED |
 | Company scorecard (10 independent dimensions, no aggregate) | IMPLEMENTED |
 | Multi-source DATA_CONFLICT (comparator, persistent register, health gate, operator-only resolution) | IMPLEMENTED (exercised with two MOCK sources; a second real source is NOT IMPLEMENTED) |
 | Text/news evidence layering (raw / verbatim facts / model interpretation; one source per source id) | IMPLEMENTED (structure only); news ingestion NOT IMPLEMENTED |

@@ -61,6 +61,8 @@ Claude ─► Market ─► Research ─► Decision ─► Risk ─► Executio
 | Claude operates the company only through closed, gated actions | `parse_company_response` (closed vocabulary bound to request+cycle), health gate per action, routing only to existing pipeline/risk/execution/research; see `docs/COMPANY_CONTROL_PLANE.md` | `test_company_control.py` |
 | Learning never changes a rule; holdout outcomes never feed hypotheses | `LearningLedger` holds no registry/risk/execution reference; candidate state follows `ResearchLog` facts; `holdout_derived` candidates and holdout/promotion evidence refs are refused as motivation | `test_self_improvement.py` |
 | Baseline never silently replaced; no single-metric optimization | baseline registered under its own key before a designed experiment, candidate derived as a child; `objectives.compare` reports every dimension, constraints first | `test_self_improvement.py` |
+| A used holdout is never reused, overlapped or turned into development data | control-plane research windows exclude every sealed range (`sealed_ranges`, restored from the research journal at startup); diagnostics use development partitions only | `test_company_intelligence.py` |
+| Diagnostics and assumption monitors never authorize anything | REGIME/EXECUTION/RISK record experiments without challengers, holdouts or promotions; monitors only emit learning outcomes | `test_company_intelligence.py` |
 | Claude output cannot command | closed schema, unknown keys rejected, no execution path | `test_claude_contract_security.py` |
 
 ## Decision pipeline (one trade candidate)

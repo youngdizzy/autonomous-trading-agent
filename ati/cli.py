@@ -187,7 +187,7 @@ def _company(state_dir: Path, data: str):
     return CompanyControlPlane(system)
 
 
-def company(cmd: str, state_dir: Path, data: str, ack: str | None) -> int:
+def company(cmd: str, state_dir: Path, data: str, ack: str | None, max_cycles: int = 1) -> int:
     from ati.core.errors import AtiError as _AtiError
 
     try:
@@ -203,6 +203,19 @@ def company(cmd: str, state_dir: Path, data: str, ack: str | None) -> int:
         except (PermissionError, _AtiError) as exc:
             print(f"resume refused: {exc}")
             return 6
+    elif cmd == "readiness":
+        from ati.company.readiness import report
+
+        print(json.dumps(report(cp), indent=2, default=str))
+        return 0
+    elif cmd == "run":
+        # Scheduler entry point: bounded cycles; stops at the first cycle that needs Claude or does not complete.
+        # A future scheduler calls this; it never becomes an authority itself.
+        for _ in range(max(1, min(max_cycles, 24))):
+            outcome = cp.run_cycle()
+            print(json.dumps({"cycle_id": outcome.cycle_id, "status": outcome.status, "action": outcome.action}))
+            if outcome.status not in ("COMPLETED",):
+                break
     elif cmd == "cycle":
         outcome = cp.run_cycle()
         print(json.dumps({"cycle_id": outcome.cycle_id, "status": outcome.status, "action": outcome.action,
@@ -244,13 +257,14 @@ def main(argv: list[str] | None = None) -> int:
     r = sub.add_parser("research-real", help="run the pre-declared REAL research protocol once")
     r.add_argument("--state-dir", type=Path, required=True)
     c = sub.add_parser("company", help="company control plane: one bounded cycle, status, pause, resume")
-    c.add_argument("action", choices=["cycle", "status", "pause", "resume"])
+    c.add_argument("action", choices=["cycle", "run", "status", "readiness", "pause", "resume"])
     c.add_argument("--state-dir", type=Path, required=True)
     c.add_argument("--data", choices=["mock", "kraken"], required=True)
     c.add_argument("--ack", default=None, help="operator acknowledgement phrase (resume only)")
+    c.add_argument("--max-cycles", type=int, default=6, help="run: at most this many cycles (capped at 24)")
     args = parser.parse_args(argv)
     if args.cmd == "company":
-        return company(args.action, args.state_dir, args.data, args.ack)
+        return company(args.action, args.state_dir, args.data, args.ack, args.max_cycles)
     if args.cmd == "ingest-kraken":
         return ingest_kraken(args.state_dir, args.symbol)
     if args.cmd == "research-real":

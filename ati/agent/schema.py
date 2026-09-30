@@ -240,7 +240,7 @@ def parse_post_trade_output(raw: str) -> PostTradeReview:
 COMPANY_ACTIONS = ("NO_TRADE", "TRADE_PROPOSAL", "RESEARCH_REQUEST", "PAUSE", "REQUEST_DATA",
                    "REVIEW_POSITION", "REVIEW_RISK", "REVIEW_SYSTEM")
 READ_ONLY_ACTIONS = frozenset({"NO_TRADE", "REQUEST_DATA", "REVIEW_POSITION", "REVIEW_RISK", "REVIEW_SYSTEM"})
-_COMPANY_ENVELOPE = frozenset({"request_id", "cycle_id", "action", "reason", "payload"})
+_COMPANY_ENVELOPE = frozenset({"request_id", "cycle_id", "context_id", "action", "reason", "payload"})
 _COMPANY_PAYLOAD = {
     "NO_TRADE": (frozenset(), frozenset()),
     "TRADE_PROPOSAL": (frozenset({"symbol", "side", "strategy_key", "entry_price", "stop_price", "thesis",
@@ -261,8 +261,8 @@ RESEARCH_EVIDENCE_TYPES = frozenset({"walk_forward", "robustness", "adversarial"
 # control plane can *execute* is decided there (unimplemented executors are BLOCKED, never approximated).
 EXPERIMENT_TYPES = frozenset({"SINGLE_VARIABLE", "INTERACTION", "STRUCTURAL", "REGIME", "EXECUTION", "RISK"})
 _EXPERIMENT_FIELDS = frozenset({"type", "independent_variables", "dependent_variable", "controls",
-                                "failure_criteria", "stopping_criteria"})
-_EXPERIMENT_OPTIONAL = frozenset({"candidate_params"})
+                                "failure_criteria", "stopping_criteria", "design_rationale"})
+_EXPERIMENT_OPTIONAL = frozenset({"candidate_params", "structure", "condition"})
 # Evidence a hypothesis may cite. Holdout and promotion outcomes are evaluation results: citing them as
 # motivation for a new hypothesis would turn the holdout into training feedback.
 _NON_CITABLE_EVIDENCE = frozenset({"holdout", "promotion"})
@@ -301,6 +301,9 @@ class ExperimentSpec:
     failure_criteria: str
     stopping_criteria: str
     candidate_params: tuple[tuple[str, object], ...] | None   # None = the protocol baseline itself
+    design_rationale: str = ""
+    condition: tuple[tuple[str, object], ...] | None = None   # REGIME / EXECUTION / RISK
+    structure: tuple[str, tuple[tuple[str, object], ...]] | None = None   # STRUCTURAL: (kind, params)
 
 
 @dataclass(frozen=True)
@@ -322,6 +325,7 @@ class CompanyContext:
     trade: ValidationContext
     protocols: dict[str, str]            # protocol_id → the strategy key it is locked to
     protocol_params: dict[str, dict] = field(default_factory=dict)   # protocol_id → baseline parameters
+    context_id: str = ""                                             # hash of the context package Claude saw
     evidence_kind: Callable[[str], str | None] = lambda ref: None    # ref → evidence kind (None = unknown)
 
 
@@ -345,6 +349,8 @@ def parse_company_response(raw: str, ctx: CompanyContext) -> CompanyAction:
         raise SchemaViolation(f"envelope must contain exactly {sorted(_COMPANY_ENVELOPE)}")
     if obj["request_id"] != ctx.request_id or obj["cycle_id"] != ctx.cycle_id:
         raise SchemaViolation("response is bound to a different request or cycle")
+    if obj["context_id"] != ctx.context_id:
+        raise SchemaViolation("response is bound to a different context (the state it reasoned about has changed)")
     action = obj["action"]
     if action not in COMPANY_ACTIONS:
         raise SchemaViolation(f"unrecognized company action {action!r}")
@@ -415,14 +421,32 @@ def _research_spec(p: dict, ctx: CompanyContext) -> ResearchSpec:
         raise SchemaViolation("learning_candidate_id must be a learning candidate id (lc_ + 20 hex)")
     experiment = _experiment(p["experiment"], ctx.protocol_params.get(p["protocol_id"], {})) \
         if "experiment" in p else None
+    if lc is not None and experiment is None:
+        raise SchemaViolation("a hypothesis from a learning candidate needs an explicit experiment design")
+    if experiment is not None:
+        for k in ("motivation", "expected_mechanism"):
+            _text(p, k, limit=400)   # required: a designed experiment states why and through what mechanism
     return ResearchSpec(hid, p["protocol_id"], _text(p, "question"), _text(p, "statement"), p["strategy_key"],
                         tuple(ev), tuple(parsed), _text(p, "scope", required=False, limit=300),
                         _text(p, "motivation", required=False, limit=400),
                         _text(p, "expected_mechanism", required=False, limit=400), tuple(refs), lc, experiment)
 
 
+def _number(v, where: str) -> float | int:
+    if isinstance(v, bool) or not isinstance(v, (int, float)) or not math.isfinite(v):
+        raise SchemaViolation(f"{where} must be a finite number")
+    return v
+
+
 def _experiment(e, base: dict) -> ExperimentSpec:
-    """Structure and internal consistency only. The executor decides what may run."""
+    """Structure and internal consistency only. Executors re-check bounds; nothing here runs anything.
+
+    SINGLE_VARIABLE / INTERACTION  candidate_params = every baseline parameter; 1 / >=2 changed
+    STRUCTURAL                     structure = {kind, params}: a different *already-registered* strategy logic
+    REGIME                         condition = {regime: label}; baseline fixed (development diagnostic)
+    EXECUTION                      condition = {cost_multiplier >= 1} or {entry_delay_bars}; (diagnostic)
+    RISK                           condition = {risk_fraction}; backtest sizing only (diagnostic)
+    """
     if not isinstance(e, dict):
         raise SchemaViolation("experiment must be an object")
     missing, extra = _EXPERIMENT_FIELDS - e.keys(), e.keys() - _EXPERIMENT_FIELDS - _EXPERIMENT_OPTIONAL
@@ -441,9 +465,16 @@ def _experiment(e, base: dict) -> ExperimentSpec:
         Criterion(dv, ">", 0.0)
     except (ValueError, TypeError):
         raise SchemaViolation(f"dependent_variable {dv!r} is not a recorded metric") from None
-    texts = {k: _text(e, k, limit=300) for k in ("controls", "failure_criteria", "stopping_criteria")}
-    params = None
-    if "candidate_params" in e:
+    texts = {k: _text(e, k, limit=300) for k in ("controls", "failure_criteria", "stopping_criteria", "design_rationale")}
+    allowed_extra = {"SINGLE_VARIABLE": "candidate_params", "INTERACTION": "candidate_params", "STRUCTURAL": "structure",
+                     "REGIME": "condition", "EXECUTION": "condition", "RISK": "condition"}[kind]
+    stray = (e.keys() & _EXPERIMENT_OPTIONAL) - {allowed_extra}
+    if stray:
+        raise SchemaViolation(f"{kind} experiments do not take {sorted(stray)}")
+    if allowed_extra not in e:
+        raise SchemaViolation(f"{kind} experiments require {allowed_extra}")
+    params = condition = structure = None
+    if allowed_extra == "candidate_params":
         cp = e["candidate_params"]
         if not isinstance(cp, dict) or not base or set(cp) != set(base):
             raise SchemaViolation("candidate_params must give every baseline parameter (and nothing else)")
@@ -459,12 +490,45 @@ def _experiment(e, base: dict) -> ExperimentSpec:
             raise SchemaViolation(f"SINGLE_VARIABLE changes exactly one parameter (changed: {changed})")
         if kind == "INTERACTION" and len(changed) < 2:
             raise SchemaViolation(f"INTERACTION changes at least two parameters (changed: {changed})")
-        if kind in ("SINGLE_VARIABLE", "INTERACTION") and sorted(iv) != changed:
+        if sorted(iv) != changed:
             raise SchemaViolation(f"independent_variables {sorted(iv)} must name exactly the changed parameters {changed}")
-        if kind == "REGIME" and changed:
-            raise SchemaViolation("REGIME experiments hold parameters fixed (the regime is the variable)")
         params = tuple(sorted(cp.items()))
-    elif kind in ("SINGLE_VARIABLE", "INTERACTION"):
-        raise SchemaViolation(f"{kind} experiments require candidate_params")
+    elif allowed_extra == "structure":
+        st = e["structure"]
+        if not isinstance(st, dict) or set(st) != {"kind", "params"} or not isinstance(st["kind"], str) \
+                or not _HYPOTHESIS_ID.match(st["kind"]) or not isinstance(st["params"], dict) or len(st["params"]) > 8:
+            raise SchemaViolation("structure must be {kind: registered strategy kind, params: {name: number}}")
+        for k, v in st["params"].items():
+            if not isinstance(k, str) or len(k) > 40:
+                raise SchemaViolation("structure.params keys must be short names")
+            _number(v, f"structure.params.{k}")
+        if iv != ["structure"]:
+            raise SchemaViolation("STRUCTURAL independent_variables must be exactly ['structure']")
+        structure = (st["kind"], tuple(sorted(st["params"].items())))
+    else:
+        cond = e["condition"]
+        if not isinstance(cond, dict) or len(cond) != 1:
+            raise SchemaViolation("condition must be an object with exactly one entry")
+        (name, value), = cond.items()
+        allowed = {"REGIME": {"regime"}, "EXECUTION": {"cost_multiplier", "entry_delay_bars"},
+                   "RISK": {"risk_fraction"}}[kind]
+        if name not in allowed:
+            raise SchemaViolation(f"{kind} condition must be one of {sorted(allowed)}")
+        from ati.research.diagnostics import EXECUTION_BOUNDS, REGIME_LABELS, RISK_BOUNDS
+        if name == "regime":
+            if value not in REGIME_LABELS:
+                raise SchemaViolation(f"regime must be one of {list(REGIME_LABELS)}")
+        else:
+            lo, hi = (EXECUTION_BOUNDS | RISK_BOUNDS)[name]
+            _number(value, f"condition.{name}")
+            if name == "entry_delay_bars" and not isinstance(value, int):
+                raise SchemaViolation("entry_delay_bars must be an integer")
+            if not lo <= value <= hi:
+                raise SchemaViolation(f"condition.{name} must be within [{lo}, {hi}]"
+                                      + (": costs may be stressed, never reduced below the model"
+                                         if name == "cost_multiplier" else ""))
+        if iv != [name]:
+            raise SchemaViolation(f"{kind} independent_variables must be exactly [{name!r}]")
+        condition = ((name, value),)
     return ExperimentSpec(kind, tuple(iv), dv, texts["controls"], texts["failure_criteria"], texts["stopping_criteria"],
-                          params)
+                          params, texts["design_rationale"], condition, structure)

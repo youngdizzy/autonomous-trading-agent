@@ -47,10 +47,11 @@ class Quality(str, Enum):
 
 
 class PatternClass(str, Enum):
-    ONE_OFF = "ONE_OFF"
-    RECURRING = "RECURRING_PATTERN"
-    STATISTICALLY_SUPPORTED = "STATISTICALLY_SUPPORTED_EFFECT"
-    VALIDATED_DOCTRINE = "VALIDATED_DOCTRINE"
+    ONE_OFF = "ONE_OFF"                        # 1 outcome: never doctrine, never a rule
+    POSSIBLE_PATTERN = "POSSIBLE_PATTERN"      # 2 independent outcomes
+    RECURRING_PATTERN = "RECURRING_PATTERN"    # 3+ independent outcomes
+    SUPPORTED_EFFECT = "SUPPORTED_EFFECT"      # linked hypothesis passed development AND holdout
+    VALIDATED_EFFECT = "VALIDATED_EFFECT"      # as supported, on market data, with an approved promotion
 
 
 class CandidateState(str, Enum):
@@ -122,32 +123,73 @@ def _v(value) -> str:
 
 
 # --- outcome extraction ------------------------------------------------------------------------------------
-def extract_outcomes(system, loop_journal: Journal, company_journal: Journal) -> list[OutcomeRecord]:
+def _regime_at(system, symbol: str, cutoff) -> str | None:
+    """Point-in-time regime label (volatility × trend) at a decision cutoff, from stored bars up to the cutoff."""
+    from ati.data.dataset import Dataset
+    from ati.research.robustness import regime_labels
+
+    bars = [c for c in system.store.series(system.provider.name, symbol, system.timeframe) if c.close_time <= cutoff]
+    if len(bars) < 160:
+        return None
+    ds = Dataset.build(bars[-300:], data_version="learning-view", realization=getattr(system.provider, "realization", "observed"))
+    label = regime_labels(ds).get(bars[-1].close_time)
+    return "/".join(label) if label else None
+
+
+def extract_outcomes(system, loop_journal: Journal, company_journal: Journal,
+                     known: frozenset[str] | set[str] = frozenset()) -> list[OutcomeRecord]:
+    """``known``: outcome ids already recorded — skipped before any expensive derivation (regime labels)."""
     s = system
     cat = s.data_status.value
     out: list[OutcomeRecord] = []
     decisions = {e.payload["decision_id"]: decode(e.payload)["record"] for e in s.decisions.journal.entries("decision")}
     for e in loop_journal.entries("trade_review"):
+        if e.payload["review_id"] in known:
+            continue
         p = decode(e.payload)
         f = p["facts"]
         rec = decisions.get(f.get("entry_decision_id"), {})
         entry, exit_, qty, fees = f.get("entry_price"), f.get("exit_price"), f.get("qty"), f.get("fees") or Decimal(0)
-        pnl = (exit_ - entry) * qty - fees if None not in (entry, exit_, qty) else None
+        gross = (exit_ - entry) * qty if None not in (entry, exit_, qty) else None
+        pnl = gross - fees if gross is not None else None
         expected_loss = rec.get("expected_risk")
+        mctx = dict(rec.get("market_context") or ())
+        ref = Decimal(mctx["last_price"]) if "last_price" in mctx else None
+        slippage = (entry - ref) / ref if entry is not None and ref else None
+        modelled = (Decimal(mctx.get("est_spread_rate", "0")) + Decimal(mctx.get("est_slippage_rate", "0"))) if mctx else None
         deviation = {}
         if pnl is not None and expected_loss is not None and pnl < 0 and -pnl > expected_loss * Decimal("1.1"):
             deviation["loss_beyond_expected_risk"] = str(-pnl - expected_loss)
-        out.append(OutcomeRecord(p["review_id"], "trade", e.at, cat, f.get("symbol"), s.timeframe.value,
-                                 rec.get("strategy_hash"), None,
-                                 {"max_loss": str(expected_loss) if expected_loss is not None else None},
-                                 {"pnl": str(pnl) if pnl is not None else None, "exit_reason": f.get("exit_reason"),
-                                  "fees": str(fees)}, deviation, False, {"entry_decision_id": f.get("entry_decision_id")}))
+        if slippage is not None and modelled and slippage > 2 * modelled:
+            deviation["entry_slippage_beyond_model"] = str(slippage)
+        if gross is not None and gross != 0 and fees / abs(gross) > Decimal("0.5"):
+            deviation["costs_over_half_of_gross"] = str(fees / abs(gross))
+        cutoff = rec.get("available_information_cutoff")
+        out.append(OutcomeRecord(
+            p["review_id"], "trade", e.at, cat, f.get("symbol"), s.timeframe.value, rec.get("strategy_hash"), None,
+            {"max_loss": str(expected_loss) if expected_loss is not None else None,
+             "expected_reward": str(rec["expected_reward"]) if rec.get("expected_reward") is not None else None,
+             "modelled_cost_rate": str(modelled) if modelled is not None else None},
+            {"pnl": str(pnl) if pnl is not None else None, "gross": str(gross) if gross is not None else None,
+             "exit_reason": f.get("exit_reason"), "fees": str(fees), "entry": str(entry), "exit": str(exit_),
+             "entry_slippage": str(slippage) if slippage is not None else None},
+            deviation, False,
+            {"trade_id": f.get("entry_decision_id"), "thesis": (rec.get("thesis") or "")[:200],
+             "risk_state": {"approved_size": str(rec.get("approved_size")), "limits_hash": rec.get("risk_limits_hash")},
+             "regime": _regime_at(s, f["symbol"], cutoff) if cutoff and f.get("symbol") else None,
+             "execution_quality": "WITHIN_MODEL" if "entry_slippage_beyond_model" not in deviation else "DEVIATED"}))
     for e in s.research_journal.entries("experiment"):
         p = decode(e.payload)
         out.append(OutcomeRecord(f"exp:{e.hash[:24]}", "experiment", e.at, cat, None, None, p["prereg_hash"][:24],
                                  p["dataset_id"], {"criteria": p["prereg_hash"][:12]},
                                  {"verdict": _v(p["verdict"]), "stage": p["stage"]}, {}, p["stage"] == "holdout",
                                  {"hypothesis_id": p["hypothesis_id"]}))
+    for e in s.research_journal.entries("adversarial_report"):
+        r = decode(e.payload)["report"]
+        failed = sorted(o["question"] for o in r["objections"] if _v(o["verdict"]) == "FAIL")
+        if failed:   # development-partition robustness evidence (the adversarial review never sees the holdout)
+            out.append(OutcomeRecord(f"adv:{e.hash[:24]}", "robustness", e.at, cat, None, None, r["strategy_hash"],
+                                     r["dataset_id"], {}, {"failed": failed}, {}, False, {"strategy_key": r["strategy_key"]}))
     for e in s.research_journal.entries("promotion_decision"):
         r = decode(e.payload)["record"]
         out.append(OutcomeRecord(f"promo:{r['record_hash'][:24]}", "promotion", e.at, cat, None, None,
@@ -157,46 +199,105 @@ def extract_outcomes(system, loop_journal: Journal, company_journal: Journal) ->
         err = str(e.payload.get("error", ""))
         out.append(OutcomeRecord(f"data:{e.hash[:24]}", "data_failure", e.at, cat, facts={"error": err[:200]},
                                  realized={"kind": err.split(":")[0][:60] or "unknown"}))
+    seen_shift_days: set[tuple[str, str]] = set()
     for e in company_journal.entries("cycle_step"):
         if e.payload["step"] == "rejected":
             out.append(OutcomeRecord(f"resp:{e.hash[:24]}", "response_rejected", e.at, cat,
                                      facts={"reason": str(e.payload["data"].get("reason", ""))[:200]},
                                      realized={"kind": str(e.payload["data"].get("reason", "")).split(":")[0][:60]}))
+        elif e.payload["step"] == "conditions":
+            for m in e.payload["data"]["monitors"]:
+                day = (m["assumption"], e.at[:10])   # a persisting shift is one observation per day, not one per cycle
+                if m["status"] == "SHIFT_DETECTED" and day not in seen_shift_days:
+                    seen_shift_days.add(day)
+                    out.append(OutcomeRecord(f"cond:{m['assumption']}:{e.at[:10]}", "condition_shift", e.at, cat,
+                                             realized={"assumption": m["assumption"], "statistic": m["statistic"]}))
     return out
 
 
 # --- deterministic detectors -------------------------------------------------------------------------------
+def _pnl(o: OutcomeRecord) -> Decimal | None:
+    return Decimal(o.realized["pnl"]) if o.realized.get("pnl") not in (None, "None") else None
+
+
 def _groups(outcomes: list[OutcomeRecord]) -> dict[tuple, list[OutcomeRecord]]:
     g: dict[tuple, list[OutcomeRecord]] = {}
 
     def add(pattern, key: dict, o: OutcomeRecord):
         g.setdefault((pattern, tuple(sorted(key.items()))), []).append(o)
 
+    trades_by_strategy: dict[str, list[OutcomeRecord]] = {}
     for o in outcomes:
-        if o.source == "trade" and o.realized.get("pnl") is not None and Decimal(o.realized["pnl"]) < 0:
+        pnl = _pnl(o) if o.source == "trade" else None
+        if o.source == "trade" and pnl is not None:
+            trades_by_strategy.setdefault(o.strategy, []).append(o)
+        if pnl is not None and pnl < 0:
             add("REPEATED_LOSS", {"strategy": o.strategy, "symbol": o.symbol, "exit_reason": o.realized.get("exit_reason")}, o)
-        if o.source == "trade" and o.deviation.get("loss_beyond_expected_risk"):
+            if o.facts.get("regime"):
+                add("REGIME_FAILURE", {"strategy": o.strategy, "regime": o.facts["regime"]}, o)
+        if o.source == "trade" and (o.deviation.get("loss_beyond_expected_risk") or
+                                    o.deviation.get("entry_slippage_beyond_model")):
             add("EXECUTION_DEVIATION", {"strategy": o.strategy, "symbol": o.symbol}, o)
+        if o.source == "trade" and o.deviation.get("costs_over_half_of_gross"):
+            add("UNEXPECTED_COSTS", {"strategy": o.strategy, "symbol": o.symbol}, o)
         if o.source == "experiment" and o.realized["verdict"] in ("FAIL", "INSUFFICIENT_EVIDENCE"):
             kind = "HOLDOUT_FAILURE" if o.holdout_derived else "RESEARCH_FAILURE"
             add(kind, {"stage": o.realized["stage"], "verdict": o.realized["verdict"]}, o)
+        if o.source == "robustness":
+            for q in o.realized["failed"]:
+                if "parameter" in q:
+                    add("PARAMETER_INSTABILITY", {"question": q}, o)
+                elif any(w in q for w in ("costs", "delay", "regimes", "time periods", "liquidity")):
+                    add("ROBUSTNESS_FAILURE", {"question": q}, o)
         if o.source == "promotion" and not o.realized["approved"]:
             add("PROMOTION_DENIED", {"challenger": o.facts.get("challenger_key")}, o)
         if o.source == "data_failure":
             add("DATA_FAILURE", {"kind": o.realized["kind"]}, o)
         if o.source == "response_rejected":
             add("CONTRACT_REJECTION", {"kind": o.realized["kind"]}, o)
+        if o.source == "condition_shift":
+            add("CONDITION_SHIFT", {"assumption": o.realized["assumption"]}, o)
+    for strategy, trades in trades_by_strategy.items():
+        trades.sort(key=lambda o: o.at)
+        streak: list[OutcomeRecord] = []
+        for o in trades:                       # drawdown cluster: 3+ consecutive losing trades
+            streak = streak + [o] if _pnl(o) < 0 else []
+            if len(streak) >= 3:
+                for m in streak:
+                    add("DRAWDOWN_CLUSTER", {"strategy": strategy}, m)
+        if len(trades) >= 10:                  # degradation: later half worse than earlier half, and negative
+            half = len(trades) // 2
+            early = sum(_pnl(o) for o in trades[:half]) / half
+            late_trades = trades[half:]
+            late = sum(_pnl(o) for o in late_trades) / len(late_trades)
+            if late < early and late < 0:
+                for m in late_trades:
+                    add("STRATEGY_DEGRADATION", {"strategy": strategy}, m)
+    for k in list(g):                          # an outcome is evidence once per pattern
+        seen, uniq = set(), []
+        for o in g[k]:
+            if o.outcome_id not in seen:
+                seen.add(o.outcome_id)
+                uniq.append(o)
+        g[k] = uniq
     return g
 
 
 _TEMPLATES = {
     "REPEATED_LOSS": "Losses recur for strategy {strategy} on {symbol} with exit reason {exit_reason}",
-    "EXECUTION_DEVIATION": "Realized losses exceeded the risk engine's expected maximum for {strategy} on {symbol}",
+    "REGIME_FAILURE": "Losses of strategy {strategy} concentrate in regime {regime}",
+    "EXECUTION_DEVIATION": "Paper execution deviated from the risk engine's expectation for {strategy} on {symbol}",
+    "UNEXPECTED_COSTS": "Costs consumed more than half of gross P&L for {strategy} on {symbol}",
+    "DRAWDOWN_CLUSTER": "Losing trades of strategy {strategy} cluster (3+ consecutive losses)",
+    "STRATEGY_DEGRADATION": "Recent trades of strategy {strategy} perform worse than earlier ones and are net negative",
     "RESEARCH_FAILURE": "Experiments fail at stage {stage} with verdict {verdict}",
     "HOLDOUT_FAILURE": "Holdout evaluations end {verdict} (evaluation outcome; not usable as training feedback)",
+    "ROBUSTNESS_FAILURE": "Adversarial robustness check fails repeatedly: {question}",
+    "PARAMETER_INSTABILITY": "Results are unstable under parameter perturbation: {question}",
     "PROMOTION_DENIED": "Promotion of {challenger} was denied",
     "DATA_FAILURE": "Data failures recur: {kind}",
     "CONTRACT_REJECTION": "Claude responses are rejected by the contract: {kind}",
+    "CONDITION_SHIFT": "Assumption monitor reports a shift: {assumption}",
 }
 
 
@@ -240,7 +341,7 @@ class LearningLedger:
     def learn(self, system, loop_journal: Journal, company_journal: Journal) -> dict:
         """Idempotent: re-running over unchanged journals writes nothing."""
         new_outcomes = 0
-        for o in extract_outcomes(system, loop_journal, company_journal):
+        for o in extract_outcomes(system, loop_journal, company_journal, set(self.outcomes)):
             if o.outcome_id not in self.outcomes:
                 self.journal.append("outcome", {"outcome_id": o.outcome_id, "record": o})
                 self.outcomes[o.outcome_id] = o
@@ -293,7 +394,11 @@ class LearningLedger:
                 self._transition(c, _C.TESTING, f"{h} tested in development")
             if c.state is not _C.TESTING:
                 continue
-            if dev == "TESTED:FAIL" or hold == "TESTED:FAIL":
+            diagnostic = any(e["hypothesis_id"] == h and str(e["stage"]).startswith("diagnostic:") for e in log.experiments)
+            if diagnostic and dev != "TESTED:FAIL":
+                self._transition(c, _C.INCONCLUSIVE, f"{h}: development-only diagnostic {dev}; development evidence "
+                                                     "alone cannot support an effect")
+            elif dev == "TESTED:FAIL" or hold == "TESTED:FAIL":
                 self._transition(c, _C.REJECTED, f"{h}: development {dev}, holdout {hold}")
             elif dev == "TESTED:PASS" and hold == "TESTED:PASS":
                 self._transition(c, _C.SUPPORTED, f"{h}: passed development and holdout "
@@ -311,10 +416,11 @@ class LearningLedger:
     def pattern_class(self, c: LearningCandidate, system) -> PatternClass:
         q = self.quality(c, system)
         if q is Quality.VALIDATED_EVIDENCE:
-            return PatternClass.VALIDATED_DOCTRINE
+            return PatternClass.VALIDATED_EFFECT
         if q is Quality.SUPPORTED_EVIDENCE:
-            return PatternClass.STATISTICALLY_SUPPORTED
-        return PatternClass.ONE_OFF if len(c.evidence) <= 1 else PatternClass.RECURRING
+            return PatternClass.SUPPORTED_EFFECT
+        n = len(c.evidence)
+        return PatternClass.ONE_OFF if n <= 1 else PatternClass.POSSIBLE_PATTERN if n == 2 else PatternClass.RECURRING_PATTERN
 
     def summary(self, system, limit: int = 8) -> list[dict]:
         ordered = sorted(self.candidates.values(), key=lambda c: (-len(c.evidence), c.candidate_id))[:limit]

@@ -248,6 +248,13 @@ def overlapping_sealed_range(identity: DatasetIdentity) -> tuple | None:
     return None
 
 
+def sealed_ranges(provider: str, symbol: str, timeframe: Timeframe, realization: str) -> list[tuple[datetime, datetime]]:
+    """Read-only: sealed holdout periods [start, end) for one series, sorted. Used to choose research windows
+    that never overlap a holdout that has already been used."""
+    return sorted((start, end) for p, sym, tf, real, start, end in _SEALED
+                  if (p, sym, tf, real) == (provider, symbol, timeframe, realization))
+
+
 def _clear_sealed_ranges_for_tests() -> None:
     _SEALED.clear()
 
