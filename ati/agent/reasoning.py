@@ -18,7 +18,9 @@ import hashlib
 from pathlib import Path
 from typing import Callable, Protocol
 
-from ati.core.errors import AtiError
+from ati.core.errors import AtiError, SchemaViolation
+
+MAX_RESPONSE_BYTES = 64 * 1024
 
 
 class ReasoningPending(AtiError):
@@ -84,7 +86,13 @@ class FileExchangeClient:
     def complete(self, role: str, request_id: str, prompt: str) -> str:
         name = self._name(role, request_id)
         response = self.root / "responses" / f"{name}.json"
-        if response.exists():
+        if response.exists() or response.is_symlink():
+            # The exchange directory is untrusted input: only a small regular file is read, never a link
+            # that could point elsewhere on the filesystem.
+            if response.is_symlink() or not response.is_file():
+                raise SchemaViolation("response must be a regular file inside the exchange directory")
+            if response.stat().st_size > MAX_RESPONSE_BYTES:
+                raise SchemaViolation("response file too large")
             self.budget.spend()
             return response.read_text(encoding="utf-8")
         request = self.root / "requests" / f"{name}.md"

@@ -13,6 +13,7 @@ everything runnable today uses data labelled **MOCK**.
 - Security boundaries: [`docs/SECURITY.md`](docs/SECURITY.md)
 - Environment audit: [`docs/ENVIRONMENT_CAPABILITY_AUDIT.md`](docs/ENVIRONMENT_CAPABILITY_AUDIT.md)
 - Real-data boundary and provenance: [`docs/REAL_DATA_ACTIVATION.md`](docs/REAL_DATA_ACTIVATION.md)
+- Company control plane (Claude's operating contract): [`docs/COMPANY_CONTROL_PLANE.md`](docs/COMPANY_CONTROL_PLANE.md)
 
 ## Run
 

@@ -43,6 +43,8 @@ Vocabulary is exact. Nothing below is upgraded from one state to another.
 | Claude output schema, roles, MOCK and file-exchange reasoning clients | IMPLEMENTED |
 | Direct Claude API reasoning client | NOT IMPLEMENTED (BLOCKED — CREDENTIALS) |
 | Autonomous loop (resumable tick) | IMPLEMENTED |
+| Company control plane (Phase 1: closed actions, health gate, pause, recovery, idempotent cycles) | IMPLEMENTED (MOCK data and REAL-unavailable paths verified; REAL-available path untested — no REAL data) |
+| Claude company decisions via file exchange | IMPLEMENTED — manual: a Claude session must write each response file |
 | Scheduled autonomous operation (Routine driving the loop) | NOT IMPLEMENTED (mechanism available, not configured) |
 | Status view | IMPLEMENTED (CLI demo prints it) |
 | Real-money readiness | INSUFFICIENT EVIDENCE — no real data, no real fills, no out-of-sample record |

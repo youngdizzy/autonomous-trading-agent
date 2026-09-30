@@ -124,17 +124,40 @@ class AutonomousLoop:
     def _run(self, report: TickReport) -> None:
         s = self.s
         now = s.clock.now()
-
         self._stage(report, "HEALTH")
         s.execution.journal.verify()
         s.decisions.journal.verify()
+        datasets = self.refresh_data(report, now)
+        if not self.reconcile(report):
+            return
+        if not report.data_ok:
+            report.stopped_at = "DATA"
+            return
+        marks = self.update_risk_state(report, datasets, now)
+        champion = s.strategies.champion()
+        for symbol, ds in datasets.items():
+            candidate = self.manage_position(report, symbol, ds, marks, champion)
+            if candidate is None:
+                continue
+            view, pf, mkt = candidate
+            if s.kill_switch.engaged:
+                report.actions.append(f"{symbol}: LONG signal ignored — kill switch engaged")
+                continue
+            self._stage(report, "DECIDE")
+            self.record_entry(report, symbol, s.pipeline.entry(champion, view, pf, mkt), champion)
 
+    # --- deterministic stages (shared with ati.company.control) --------------------------------------
+    def refresh_data(self, report: TickReport, now) -> dict[str, Dataset]:
+        """Fetch → archive → store → validated dataset per symbol. Any failure leaves ``data_ok`` False."""
+        s = self.s
         self._stage(report, "DATA")
         datasets: dict[str, Dataset] = {}
+        self.last_data_error: Exception | None = None
         try:
             for symbol in s.symbols:
                 start = now - s.timeframe.delta * self.history_bars
-                start = start - timedelta(seconds=int(start.timestamp()) % s.timeframe.seconds)
+                start = start - timedelta(microseconds=start.microsecond)
+                start = start - timedelta(seconds=int(start.timestamp()) % s.timeframe.seconds)  # bar-aligned
                 closed = [c for c in s.provider.fetch_candles(symbol, s.timeframe, start, now) if c.is_closed]
                 if not closed:
                     raise DataIntegrityError("EMPTY", f"no closed candles for {symbol}")
@@ -146,22 +169,24 @@ class AutonomousLoop:
                 datasets[symbol] = Dataset.build(series, data_version="live-window", realization="observed")
             report.data_ok = True
         except (ProviderError, DataIntegrityError, AtiError) as exc:
+            self.last_data_error = exc
             report.errors.append(f"data: {type(exc).__name__}: {exc}")
             self._log("data_unhealthy", {"error": str(exc)[:500]})
+        return datasets
 
+    def reconcile(self, report: TickReport) -> bool:
         self._stage(report, "RECONCILE")
-        recon = s.execution.reconcile()
+        recon = self.s.execution.reconcile()
         report.reconciliation = recon.state.value
         if recon.state is not ReconState.OK:
             report.stopped_at = "RECONCILE"
-            return
-        if not report.data_ok:
-            report.stopped_at = "DATA"
-            return
+            return False
+        return True
 
+    def update_risk_state(self, report: TickReport, datasets: dict[str, Dataset], now) -> dict[str, Decimal]:
         self._stage(report, "RISK_STATE")
         marks = {sym: ds.candles[-1].close for sym, ds in datasets.items()}
-        equity = s.execution.account.equity(marks)
+        equity = self.s.execution.account.equity(marks)
         day = now.date().isoformat()
         if self.day != day:
             self.day, self.day_start_equity = day, equity
@@ -169,50 +194,50 @@ class AutonomousLoop:
         if equity > self.peak_equity:
             self.peak_equity = equity
             self._log("peak_equity", {"equity": equity})
+        return marks
 
-        champion = s.strategies.champion()
-        for symbol, ds in datasets.items():
-            pf = s.execution.portfolio_snapshot(marks, self.day_start_equity, self.peak_equity)
-            mkt = self._market(symbol, ds)
-            held = pf.qty(symbol)
+    def manage_position(self, report: TickReport, symbol: str, ds: Dataset, marks, champion):
+        """Deterministic position management: stop exits, signal exits, stop ratchet. Returns
+        ``(view, portfolio, market)`` only when the symbol is flat and the champion signals LONG."""
+        s = self.s
+        pf = s.execution.portfolio_snapshot(marks, self.day_start_equity, self.peak_equity)
+        mkt = self._market(symbol, ds)
+        held = pf.qty(symbol)
+        self._stage(report, "MONITOR")
+        if held > 0 and symbol in self.stops:
+            stop, key, shash = self.stops[symbol]
+            if ds.candles[-1].low <= stop:
+                self._exit(report, symbol, "stop", key, shash, ds, pf, mkt)
+                return None
+        if held == 0 and symbol in self.stops:
+            self._log("stop_cleared", {"symbol": symbol, "reason": "no position"})
+            self.stops.pop(symbol)
+        self._stage(report, "SCAN")
+        if champion is None:
+            report.actions.append(f"{symbol}: no champion — research only, no trading")
+            return None
+        # Cutoff = last closed bar, so the same information always maps to the same decision id.
+        view = ds.view_at(ds.candles[-1].close_time, champion.lookback)
+        signal = champion.signal(view, held > 0)
+        if held > 0 and signal.target is Target.FLAT:
+            self._exit(report, symbol, "signal", champion.key, champion.definition_hash, ds, pf, mkt)
+            return None
+        if held > 0 and signal.stop_price and symbol in self.stops and signal.stop_price > self.stops[symbol][0]:
+            self._set_stop(symbol, signal.stop_price, champion.key, champion.definition_hash, self.entry_decisions.get(symbol, ""))
+        if held == 0 and signal.target is Target.LONG:
+            return view, pf, mkt
+        return None
 
-            self._stage(report, "MONITOR")
-            if held > 0 and symbol in self.stops:
-                stop, key, shash = self.stops[symbol]
-                if ds.candles[-1].low <= stop:
-                    self._exit(report, symbol, "stop", key, shash, ds, pf, mkt)
-                    continue
-            if held == 0 and symbol in self.stops:
-                self._log("stop_cleared", {"symbol": symbol, "reason": "no position"})
-                self.stops.pop(symbol)
-
-            self._stage(report, "SCAN")
-            if champion is None:
-                report.actions.append(f"{symbol}: no champion — research only, no trading")
-                continue
-            # Cutoff = last closed bar, so the same information always maps to the same decision id.
-            view = ds.view_at(ds.candles[-1].close_time, champion.lookback)
-            signal = champion.signal(view, held > 0)
-            if held > 0 and signal.target is Target.FLAT:
-                self._exit(report, symbol, "signal", champion.key, champion.definition_hash, ds, pf, mkt)
-                continue
-            if held > 0 and signal.stop_price and symbol in self.stops and signal.stop_price > self.stops[symbol][0]:
-                self._set_stop(symbol, signal.stop_price, champion.key, champion.definition_hash, self.entry_decisions.get(symbol, ""))
-            if held == 0 and signal.target is Target.LONG:
-                if s.kill_switch.engaged:
-                    report.actions.append(f"{symbol}: LONG signal ignored — kill switch engaged")
-                    continue
-                self._stage(report, "DECIDE")
-                result = s.pipeline.entry(champion, view, pf, mkt)
-                if result.outcome is Outcome.PENDING_REASONING:
-                    report.actions.append(f"{symbol}: awaiting Claude reasoning (no risk taken)")
-                elif result.outcome is Outcome.RECORDED:
-                    rec = result.decision
-                    report.actions.append(f"{symbol}: decision {rec.decision_id} → {rec.final_decision.value}")
-                    self.last_action = f"{rec.final_decision.value} {symbol}"
-                    order = result.order
-                    if order is not None and order.filled_qty > 0 and order.side is Side.BUY:
-                        self._set_stop(symbol, rec_stop(result), champion.key, champion.definition_hash, rec.decision_id)
+    def record_entry(self, report: TickReport, symbol: str, result, champion) -> None:
+        if result.outcome is Outcome.PENDING_REASONING:
+            report.actions.append(f"{symbol}: awaiting Claude reasoning (no risk taken)")
+        elif result.outcome is Outcome.RECORDED:
+            rec = result.decision
+            report.actions.append(f"{symbol}: decision {rec.decision_id} → {rec.final_decision.value}")
+            self.last_action = f"{rec.final_decision.value} {symbol}"
+            order = result.order
+            if order is not None and order.filled_qty > 0 and order.side is Side.BUY:
+                self._set_stop(symbol, rec_stop(result), champion.key, champion.definition_hash, rec.decision_id)
 
     # --- helpers --------------------------------------------------------------------------------
     def _market(self, symbol: str, ds: Dataset) -> MarketSnapshot:

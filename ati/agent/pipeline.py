@@ -129,6 +129,25 @@ class DecisionPipeline:
         if isinstance(out, ResearchRequest):
             return self._record(**base, final=FinalDecision.NO_TRADE, reason=f"research requested: {out.question}"[:600])
         assert isinstance(out, TradeProposal)
+        return self._route(strategy, view, pf, mkt, out, untrusted, decision_id, signal, packet, base)
+
+    def route_proposal(self, strategy: StrategyDefinition, view: PointInTimeView, pf: PortfolioSnapshot,
+                       mkt: MarketSnapshot, proposal: TradeProposal,
+                       untrusted: list[UntrustedText] | None = None) -> PipelineResult:
+        """Route an already schema-validated proposal (e.g. a company TRADE_PROPOSAL) through exactly the
+        same adversarial review → risk → decision record → execution path as ``entry``. Same deterministic
+        decision id, so a proposal and an entry for the same information can never both execute."""
+        cutoff = view.cutoff
+        signal = strategy.signal(view, pf.qty(mkt.symbol) > 0)
+        decision_id = make_decision_id(strategy.definition_hash, mkt.symbol, cutoff, "entry")
+        if decision_id in self.decisions:
+            return PipelineResult(Outcome.ALREADY_DECIDED)
+        base = dict(decision_id=decision_id, strategy=strategy, cutoff=cutoff, signal=signal, mkt=mkt, pf=pf)
+        packet = self.packet(strategy, view, signal, pf, mkt)
+        return self._route(strategy, view, pf, mkt, proposal, untrusted, decision_id, signal, packet, base)
+
+    def _route(self, strategy, view, pf, mkt, out: TradeProposal, untrusted, decision_id, signal, packet,
+               base) -> PipelineResult:
         if out.symbol != mkt.symbol:
             return self._record(**base, final=FinalDecision.INVALID_REASONING_OUTPUT,
                                 reason=f"proposal symbol {out.symbol} differs from candidate {mkt.symbol}")

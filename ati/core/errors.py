@@ -48,6 +48,10 @@ class MemoryIntegrityError(AtiError, ValueError):
     """A memory record is not supported by independent, correctly categorised canonical evidence."""
 
 
+class CompanyStateError(AtiError):
+    """Company control-plane state is illegal, contradictory or unreadable. Fail closed."""
+
+
 class LifecycleError(AtiError):
     """Illegal strategy / memory lifecycle transition."""
 

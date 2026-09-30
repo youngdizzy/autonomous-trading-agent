@@ -60,12 +60,23 @@ POST_TRADE = Role("post_trade_reviewer", Tier.LIGHT, "post_trade", _COMMON + (
     'Schema: {"process_quality":"GOOD_PROCESS|BAD_PROCESS|INSUFFICIENT_INFORMATION","notes":str,'
     '"possible_mistake":str|null}.'))
 
+COMPANY = Role("company", Tier.DEEP, "decision", _COMMON + (
+    " Task: choose exactly one company action for this cycle from `allowed_actions`. Deterministic code "
+    "validates it; risk, execution, research criteria and data provenance are not yours to change. "
+    'Schema: {"request_id": <from packet>, "cycle_id": <from packet>, "action": one of the vocabulary, '
+    '"reason": short text, "payload": {...}}. Payloads — NO_TRADE: {}; PAUSE: {}; REVIEW_RISK: {}; '
+    'REVIEW_SYSTEM: {}; REVIEW_POSITION: {"symbol"?}; REQUEST_DATA: {"need", "symbol"?}; '
+    'TRADE_PROPOSAL: {"symbol","side":"BUY","strategy_key","entry_price","stop_price","thesis",'
+    '"invalidation_condition","confidence", optional "proposed_qty","target_price","evidence_refs"}; '
+    'RESEARCH_REQUEST: {"hypothesis_id","protocol_id","question","statement","strategy_key",'
+    '"evidence_requested":[...],"success_criteria":[{"metric","op","threshold"}], optional "scope"}.'))
+
 MARKET_ANALYST = Role("market_analyst", Tier.LIGHT, "notes", _COMMON + " Task: summarize structure, trend, volatility, liquidity.")
 QUANT_RESEARCHER = Role("quant_researcher", Tier.DEEP, "notes", _COMMON + " Task: propose falsifiable hypotheses and experiment designs.")
 RISK_OFFICER = Role("risk_officer", Tier.LIGHT, "notes", _COMMON + " Task: describe downside, exposure, correlation and tail risk.")
 EXECUTION_SPECIALIST = Role("execution_specialist", Tier.LIGHT, "notes", _COMMON + " Task: assess spread, slippage and liquidity.")
 
-ROLES = {r.name: r for r in (PRIMARY, ADVERSARIAL, POST_TRADE, MARKET_ANALYST, QUANT_RESEARCHER, RISK_OFFICER,
+ROLES = {r.name: r for r in (PRIMARY, ADVERSARIAL, POST_TRADE, COMPANY, MARKET_ANALYST, QUANT_RESEARCHER, RISK_OFFICER,
                              EXECUTION_SPECIALIST)}
 
 

@@ -228,3 +228,146 @@ def parse_post_trade_output(raw: str) -> PostTradeReview:
     if mistake is not None and (not isinstance(mistake, str) or len(mistake) > 300):
         raise SchemaViolation("possible_mistake must be a short string or null")
     return PostTradeReview(obj["process_quality"], _text(obj, "notes", required=False), mistake or None)
+
+
+# --- Company control-plane contract (Company 1.0 Phase 1) ------------------------------------------------
+#
+# Envelope (exactly these keys): {"request_id", "cycle_id", "action", "reason", "payload"}.
+# The response is bound to one request/cycle; the action is one of a closed vocabulary; each action has a
+# closed payload. TRADE_PROPOSAL payloads are validated by the existing trade validator above. Free text is
+# data, and text that looks executable (shell, code, filesystem paths) is refused outright.
+
+COMPANY_ACTIONS = ("NO_TRADE", "TRADE_PROPOSAL", "RESEARCH_REQUEST", "PAUSE", "REQUEST_DATA",
+                   "REVIEW_POSITION", "REVIEW_RISK", "REVIEW_SYSTEM")
+READ_ONLY_ACTIONS = frozenset({"NO_TRADE", "REQUEST_DATA", "REVIEW_POSITION", "REVIEW_RISK", "REVIEW_SYSTEM"})
+_COMPANY_ENVELOPE = frozenset({"request_id", "cycle_id", "action", "reason", "payload"})
+_COMPANY_PAYLOAD = {
+    "NO_TRADE": (frozenset(), frozenset()),
+    "TRADE_PROPOSAL": (frozenset({"symbol", "side", "strategy_key", "entry_price", "stop_price", "thesis",
+                                  "invalidation_condition", "confidence"}),
+                       frozenset({"proposed_qty", "target_price", "evidence_refs"})),
+    "RESEARCH_REQUEST": (frozenset({"hypothesis_id", "protocol_id", "question", "statement", "strategy_key",
+                                    "evidence_requested", "success_criteria"}), frozenset({"scope"})),
+    "PAUSE": (frozenset(), frozenset()),
+    "REQUEST_DATA": (frozenset({"need"}), frozenset({"symbol"})),
+    "REVIEW_POSITION": (frozenset(), frozenset({"symbol"})),
+    "REVIEW_RISK": (frozenset(), frozenset()),
+    "REVIEW_SYSTEM": (frozenset(), frozenset()),
+}
+RESEARCH_EVIDENCE_TYPES = frozenset({"walk_forward", "robustness", "adversarial", "holdout"})
+_HYPOTHESIS_ID = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_-]{0,47}$")
+_EXECUTABLE = [re.compile(p, re.IGNORECASE) for p in (
+    r"`", r"\$\(", r"\$\{", r"\bsudo\b", r"\brm\s+-", r"\bchmod\b", r"\bcurl\s+\S", r"\bwget\s+\S",
+    r"\bimport\s+[A-Za-z_]", r"\bfrom\s+[A-Za-z_.]+\s+import\b", r"\bsubprocess\b", r"\bos\.(system|popen|remove)",
+    r"\beval\s*\(", r"\bexec\s*\(", r"__\w+__", r"\.\./", r"(^|[\s\"'=])/(etc|bin|usr|root|home|tmp|var|proc)/",
+    r"#!\s*/", r"<script", r"\|\s*(sh|bash|python)\b", r";\s*(sh|bash|python|rm)\b")]
+
+
+@dataclass(frozen=True)
+class ResearchSpec:
+    hypothesis_id: str
+    protocol_id: str
+    question: str
+    statement: str
+    strategy_key: str
+    evidence_requested: tuple[str, ...]
+    success_criteria: tuple[tuple[str, str, float], ...]
+    scope: str
+
+
+@dataclass(frozen=True)
+class CompanyAction:
+    action: str
+    request_id: str
+    cycle_id: str
+    reason: str
+    trade: TradeProposal | None = None
+    research: ResearchSpec | None = None
+    symbol: str | None = None
+    need: str | None = None
+
+
+@dataclass(frozen=True)
+class CompanyContext:
+    request_id: str
+    cycle_id: str
+    trade: ValidationContext
+    protocols: dict[str, str]            # protocol_id → the strategy key it is locked to
+
+
+def _refuse_executable(value, where: str = "response") -> None:
+    if isinstance(value, str):
+        for pattern in _EXECUTABLE:
+            if pattern.search(value):
+                raise SchemaViolation(f"{where}: executable/command-like or path content refused")
+    elif isinstance(value, dict):
+        for k, v in value.items():
+            _refuse_executable(k, where)
+            _refuse_executable(v, f"{where}.{k}")
+    elif isinstance(value, list):
+        for v in value:
+            _refuse_executable(v, where)
+
+
+def parse_company_response(raw: str, ctx: CompanyContext) -> CompanyAction:
+    obj = load_json_object(raw)
+    if set(obj) != _COMPANY_ENVELOPE:
+        raise SchemaViolation(f"envelope must contain exactly {sorted(_COMPANY_ENVELOPE)}")
+    if obj["request_id"] != ctx.request_id or obj["cycle_id"] != ctx.cycle_id:
+        raise SchemaViolation("response is bound to a different request or cycle")
+    action = obj["action"]
+    if action not in COMPANY_ACTIONS:
+        raise SchemaViolation(f"unrecognized company action {action!r}")
+    payload = obj["payload"]
+    if not isinstance(payload, dict):
+        raise SchemaViolation("payload must be an object")
+    required, optional = _COMPANY_PAYLOAD[action]
+    missing, extra = required - payload.keys(), payload.keys() - required - optional
+    if missing or extra:
+        raise SchemaViolation(f"{action}: missing {sorted(missing)} / unrecognized {sorted(extra)} payload fields")
+    _refuse_executable(obj)
+    reason = _text(obj, "reason")
+    common = dict(action=action, request_id=ctx.request_id, cycle_id=ctx.cycle_id, reason=reason)
+    if action == "TRADE_PROPOSAL":
+        proposal = parse_decision_output(json.dumps({"action": "PROPOSE_TRADE", **payload}), ctx.trade)
+        return CompanyAction(**common, trade=proposal, symbol=proposal.symbol)
+    if action == "RESEARCH_REQUEST":
+        return CompanyAction(**common, research=_research_spec(payload, ctx))
+    if action in ("REQUEST_DATA", "REVIEW_POSITION"):
+        symbol = payload.get("symbol")
+        if symbol is not None and symbol not in ctx.trade.universe:
+            raise SchemaViolation(f"unknown symbol {symbol!r}")
+        need = _text(payload, "need", limit=300) if action == "REQUEST_DATA" else None
+        return CompanyAction(**common, symbol=symbol, need=need)
+    return CompanyAction(**common)
+
+
+def _research_spec(p: dict, ctx: CompanyContext) -> ResearchSpec:
+    hid = p["hypothesis_id"]
+    if not isinstance(hid, str) or not _HYPOTHESIS_ID.match(hid):
+        raise SchemaViolation("hypothesis_id must be 1-48 of [A-Za-z0-9_-] (stages are system-assigned)")
+    if p["protocol_id"] not in ctx.protocols:
+        raise SchemaViolation(f"unknown research protocol {p['protocol_id']!r}")
+    if p["strategy_key"] != ctx.protocols[p["protocol_id"]]:
+        raise SchemaViolation("strategy_key does not match the protocol's locked strategy")
+    ev = p["evidence_requested"]
+    if not isinstance(ev, list) or not ev or not set(ev) <= RESEARCH_EVIDENCE_TYPES or len(set(ev)) != len(ev):
+        raise SchemaViolation(f"evidence_requested must be distinct values from {sorted(RESEARCH_EVIDENCE_TYPES)}")
+    crit = p["success_criteria"]
+    if not isinstance(crit, list) or len(crit) > 8:
+        raise SchemaViolation("success_criteria must be a list of at most 8 criteria")
+    parsed = []
+    for c in crit:
+        if not isinstance(c, dict) or set(c) != {"metric", "op", "threshold"}:
+            raise SchemaViolation("each criterion is exactly {metric, op, threshold}")
+        t = c["threshold"]
+        if isinstance(t, bool) or not isinstance(t, (int, float)) or not math.isfinite(t):
+            raise SchemaViolation("criterion threshold must be a finite number")
+        from ati.research.hypothesis import Criterion  # local import: research depends on nothing here
+        try:
+            Criterion(c["metric"], c["op"], float(t))
+        except (ValueError, TypeError) as exc:
+            raise SchemaViolation(f"invalid criterion: {exc}") from None
+        parsed.append((c["metric"], c["op"], float(t)))
+    return ResearchSpec(hid, p["protocol_id"], _text(p, "question"), _text(p, "statement"), p["strategy_key"],
+                        tuple(ev), tuple(parsed), _text(p, "scope", required=False, limit=300))

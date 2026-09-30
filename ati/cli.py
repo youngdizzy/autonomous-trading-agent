@@ -4,6 +4,8 @@
     python -m ati verify --state-dir DIR   verify every journal's hash chain
     python -m ati ingest-kraken --state-dir DIR   read-only Kraken OHLC fetch → REAL payload archive
     python -m ati research-real --state-dir DIR   the pre-declared REAL research protocol, run once
+    python -m ati company cycle|status|pause|resume --state-dir DIR --data mock|kraken
+                                                  one bounded company control-plane cycle (no loop, no daemon)
 
 Everything the demo produces is MOCK: generated prices, scripted reasoning. It exercises the
 mechanics; it is not evidence about any market.
@@ -169,6 +171,52 @@ def research_real(state_dir: Path) -> int:
     return 0
 
 
+def _company(state_dir: Path, data: str):
+    """Control plane over a PAPER system. ``kraken``: REAL data via the network transport (BLOCKED here).
+    ``mock``: MOCK data (fixed seed and epoch so the realization is stable across invocations)."""
+    from ati.agent.reasoning import FileExchangeClient
+    from ati.company.control import CompanyControlPlane
+    from ati.core.time import SystemClock
+
+    if data == "kraken":
+        return CompanyControlPlane(_real_system(state_dir))
+    clock = SystemClock()
+    provider = MockProvider(DEMO_SEED, clock, epoch=DEMO_START)
+    system = build_paper_system(state_dir, clock, provider, FileExchangeClient(state_dir / "exchange"),
+                                data_status=provider.data_status)
+    return CompanyControlPlane(system)
+
+
+def company(cmd: str, state_dir: Path, data: str, ack: str | None) -> int:
+    from ati.core.errors import AtiError as _AtiError
+
+    try:
+        cp = _company(state_dir, data)
+    except _AtiError as exc:  # corrupt or contradictory company state: fail closed, do nothing
+        print(f"COMPANY STATE UNTRUSTWORTHY — refusing to act: {type(exc).__name__}: {exc}")
+        return 5
+    if cmd == "pause":
+        cp.pause("operator", "operator pause")
+    elif cmd == "resume":
+        try:
+            cp.resume(ack or "")
+        except (PermissionError, _AtiError) as exc:
+            print(f"resume refused: {exc}")
+            return 6
+    elif cmd == "cycle":
+        outcome = cp.run_cycle()
+        print(json.dumps({"cycle_id": outcome.cycle_id, "status": outcome.status, "action": outcome.action,
+                          "detail": outcome.detail, "data_state": outcome.health.get("data_state")},
+                         indent=2, default=str))
+        if outcome.status == "AWAITING_CLAUDE":
+            print(f"request: {state_dir / 'exchange' / 'requests'}  (write the response JSON to exchange/responses/"
+                  "with the same file stem)")
+    last = cp.cycles.get(cp.last_finished) if cp.last_finished else None
+    print(f"company state: {cp.state.value}  paused: {cp.paused}  running: {cp.running}  "
+          f"last cycle: {last.cycle_id + ' ' + str(last.status) if last else None}")
+    return 0
+
+
 def verify(state_dir: Path) -> int:
     ok = True
     for path in sorted(state_dir.glob("*.jsonl")):
@@ -195,7 +243,14 @@ def main(argv: list[str] | None = None) -> int:
     k.add_argument("--symbol", default="BTC/USD")
     r = sub.add_parser("research-real", help="run the pre-declared REAL research protocol once")
     r.add_argument("--state-dir", type=Path, required=True)
+    c = sub.add_parser("company", help="company control plane: one bounded cycle, status, pause, resume")
+    c.add_argument("action", choices=["cycle", "status", "pause", "resume"])
+    c.add_argument("--state-dir", type=Path, required=True)
+    c.add_argument("--data", choices=["mock", "kraken"], required=True)
+    c.add_argument("--ack", default=None, help="operator acknowledgement phrase (resume only)")
     args = parser.parse_args(argv)
+    if args.cmd == "company":
+        return company(args.action, args.state_dir, args.data, args.ack)
     if args.cmd == "ingest-kraken":
         return ingest_kraken(args.state_dir, args.symbol)
     if args.cmd == "research-real":
