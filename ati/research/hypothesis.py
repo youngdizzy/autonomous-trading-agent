@@ -164,7 +164,12 @@ class ResearchLog:
         if hypothesis_id not in self._prereg:
             return "UNKNOWN"
         rows = [e for e in self._experiments if e["hypothesis_id"] == hypothesis_id]
-        return f"TESTED:{rows[-1]['verdict']}" if rows else "PREREGISTERED"
+        if not rows:
+            return "PREREGISTERED"
+        verdict = rows[-1]["verdict"]
+        # Normalized: in-process rows hold the Verdict enum, reloaded rows hold its string value. Without this the
+        # same journal answered "TESTED:Verdict.FAIL" before a restart and "TESTED:FAIL" after it.
+        return f"TESTED:{getattr(verdict, 'value', verdict)}"
 
     @property
     def hypotheses_tested(self) -> int:

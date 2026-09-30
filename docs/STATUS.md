@@ -25,6 +25,8 @@ Vocabulary is exact. Nothing below is upgraded from one state to another.
 | Series health, gap reporting, sealed-holdout commitment re-verification, dataset scorecard (`ati data-health`, readiness) | IMPLEMENTED |
 | Research on gapped data | Refused (DATA_GAP); research windows are contiguous, unsealed runs |
 | REAL candles accumulated | NONE — REAL_DATA_UNAVAILABLE |
+| Research protocol registry (`ati/research/protocols.py`: REAL-PROTOCOL-001 BTC/USD 1h, 002 BTC/USD 4h, 003 ETH/USD 1h, 004 ETH/USD 4h; deterministic protocol hashes; runs record protocol id + hash) | IMPLEMENTED — 001 executable; 002–004 declared, NOT executable (registry keys `strategy_id@version`; champion registry is single-series) |
+| Readiness contract (REAL_DATA_UNAVAILABLE · BLOCKED · INSUFFICIENT_REAL_CANDLES · VALIDATION_PENDING · INSUFFICIENT_EVIDENCE · VALIDATION_FAILED · VALIDATION_PASSED · NOT_APPLICABLE_MOCK) | IMPLEMENTED; validation states derived only from recorded protocol runs |
 | REAL research readiness (3,000-candle protocol minimum) | REAL_DATA_UNAVAILABLE; Kraken's OHLC endpoint returns ≤ 720 bars, so reaching 3,000 1h bars needs ~95 days of uninterrupted hourly accumulation (deep backfill NOT IMPLEMENTED) |
 | stdlib HTTPS transport | IMPLEMENTED — EXTERNAL VERIFICATION BLOCKED |
 | Deep historical backfill (Kraken Trades endpoint or other) | NOT IMPLEMENTED |

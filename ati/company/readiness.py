@@ -46,7 +46,12 @@ def report(cp) -> dict:
     from ati.market.accumulate import SERIES
     from ati.market.health import scorecard, verify_sealed_holdouts
 
-    data = {"scorecard": scorecard(s, SERIES, champion.definition_hash if champion else None),
+    from ati.market.health import readiness_table
+    from ati.research.protocols import REGISTRY
+
+    data = {"readiness_table": readiness_table(s, SERIES),
+            "protocols": [p.describe() for p in REGISTRY.values()],
+            "scorecard": scorecard(s, SERIES, champion.definition_hash if champion else None),
             "sealed_holdouts": verify_sealed_holdouts(s),
             "category": s.data_status.value, "market_evidence": s.data_status in MARKET_EVIDENCE_STATUSES,
             "provider": s.provider.name, "health": health.as_dict()["checks"]["data"], "data_state": health.data_state.value,

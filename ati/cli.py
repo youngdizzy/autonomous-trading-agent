@@ -146,6 +146,7 @@ def ingest_kraken(state_dir: Path, symbol: str) -> int:
 
 
 def research_real(state_dir: Path) -> int:
+    from ati.research.hypothesis import ResearchLog
     from ati.research import protocol as P
 
     s = _real_system(state_dir)
@@ -158,6 +159,13 @@ def research_real(state_dir: Path) -> int:
     full = Dataset.build(series, data_version="kraken-ohlc-archive", realization="observed")
     print(f"  dataset  : {full.dataset_id} ({len(full)} candles {full.identity.start} .. {full.identity.end})")
     boundary = full.candles[int(len(full) * (1 - P.HOLDOUT_FRACTION))].open_time
+    from ati.research.protocols import REGISTRY
+    proto = REGISTRY[P.PROTOCOL_ID]
+    if not ResearchLog(s.research_journal).was_tested(P.HYPOTHESIS_ID):
+        s.research_journal.append("protocol_run", {"protocol_id": proto.protocol_id, "protocol_hash": proto.protocol_hash,
+                                                   "kind": "validation", "hypothesis_id": P.HYPOTHESIS_ID,
+                                                   "experiment_id": None, "symbol": proto.symbol,
+                                                   "timeframe": proto.timeframe.value, "dataset_id": full.dataset_id})
     result = run_research_cycle(s, full, boundary, hypothesis_id=P.HYPOTHESIS_ID, statement=P.STATEMENT,
                                 base=P.base_definition(s.clock.now()), grid=P.GRID, criteria=P.CRITERIA,
                                 train_bars=P.TRAIN_BARS, test_bars=P.TEST_BARS, min_candles=P.MIN_CANDLES)
@@ -216,7 +224,12 @@ def data_health_cmd(state_dir: Path, data: str) -> int:
         print(f"DATA STATE UNTRUSTWORTHY: {type(exc).__name__}: {exc}")
         return 5
     champion = s.strategies.champion()
+    from ati.market.health import readiness_table
+    from ati.research.protocols import REGISTRY
+
     print(json.dumps({"category": s.data_status.value, "provider": s.provider.name,
+                      "readiness_table": readiness_table(s, SERIES),
+                      "protocols": [p.describe() for p in REGISTRY.values()],
                       "datasets": scorecard(s, SERIES, champion.definition_hash if champion else None),
                       "sealed_holdouts": verify_sealed_holdouts(s),
                       "open_conflicts": s.archive.conflicts()}, indent=2, default=str))

@@ -472,7 +472,10 @@ class TestResearchReadiness:
     @pytest.mark.parametrize("n,expected", [(0, "REAL_DATA_UNAVAILABLE"), (2999, "INSUFFICIENT_REAL_CANDLES"),
                                             (3000, "VALIDATION_PENDING"), (3001, "VALIDATION_PENDING")])
     def test_AM_AN_threshold_states(self, n, expected):
-        r = research_readiness(self.stub(n), "BTC/USD", H1, {"state": "PASS"}, P.MIN_CANDLES)
+        # the readiness contract with explicit inputs: no candle is labelled REAL (the old stub paired MOCK candles
+        # with a REAL-claiming system, which the contract now correctly classifies as MIXED)
+        from ati.market.health import classify
+        r = classify("REAL", n, n, P.MIN_CANDLES, "PASS", "NOT_RUN")
         assert r["state"] == expected and P.MIN_CANDLES == 3000
         assert "FAILED" not in r["state"]                                       # insufficient ≠ failed validation
 

@@ -49,6 +49,7 @@ from ati.memory.store import MemoryKind
 from ati.research import conditions as conditions_mod
 from ati.research import diagnostics
 from ati.research import protocol as P
+from ati.research import protocols as protocol_registry
 from ati.research.adversarial import AdversarialPolicy
 from ati.research.hypothesis import Criterion, PreRegistration, ResearchLog
 from ati.research.walkforward import walk_forward
@@ -453,6 +454,14 @@ class CompanyControlPlane:
             return "COMPLETED", {"hypothesis_id": spec.hypothesis_id, "research_status": "NOT_RUN", "reasons": [reason],
                                  "experiment_id": exp_id}
         full, boundary, _ = window
+        protocol = protocol_registry.REGISTRY[spec.protocol_id]
+        # the protocol id AND its material hash are recorded with the run: historical research always references the
+        # protocol that actually existed when it ran
+        s.research_journal.append("protocol_run", {
+            "protocol_id": protocol.protocol_id, "protocol_hash": protocol.protocol_hash,
+            "kind": "diagnostic" if diagnostic else "validation", "hypothesis_id": spec.hypothesis_id,
+            "experiment_id": exp_id, "symbol": protocol.symbol, "timeframe": protocol.timeframe.value,
+            "dataset_id": full.dataset_id})
         if exp is not None:
             # Baseline discipline: the baseline definition is registered under its own key *before* the run, so
             # a candidate is derived as a new version with the baseline as parent — never stored as the baseline.
