@@ -41,7 +41,6 @@ def report(cp) -> dict:
     except Exception as exc:   # an unreadable research history is reported, never hidden
         log = None
         research_error = f"{type(exc).__name__}: {exc}"[:300]
-    champion = s.strategies.champion()
 
     from ati.market.accumulate import SERIES
     from ati.market.health import scorecard, verify_sealed_holdouts
@@ -51,7 +50,7 @@ def report(cp) -> dict:
 
     data = {"readiness_table": readiness_table(s, SERIES),
             "protocols": [p.describe() for p in REGISTRY.values()],
-            "scorecard": scorecard(s, SERIES, champion.definition_hash if champion else None),
+            "scorecard": scorecard(s, SERIES),
             "sealed_holdouts": verify_sealed_holdouts(s),
             "category": s.data_status.value, "market_evidence": s.data_status in MARKET_EVIDENCE_STATUSES,
             "provider": s.provider.name, "health": health.as_dict()["checks"]["data"], "data_state": health.data_state.value,
@@ -60,9 +59,14 @@ def report(cp) -> dict:
                                "first": ds.candles[0].open_time.isoformat(), "last_close": ds.candles[-1].close_time.isoformat(),
                                "status": ds.identity.status.value} for sym, ds in datasets.items()} or "NOT_AVAILABLE"}
 
-    strategy = {"champion": {"key": champion.key, "fingerprint": champion.definition_hash, "version": champion.version,
-                             "params": champion.param_dict} if champion else "NOT_AVAILABLE",
-                "registry": {k: s.strategies.state(k).value for k in s.strategies.keys()} or "NOT_AVAILABLE",
+    champions = {f"{sym} {tf.value}": ({"registry_key": c.registry_key, "fingerprint": c.definition_hash,
+                                        "version": c.version, "params": c.param_dict}
+                                       if (c := s.strategies.champion(sym, tf)) else "NOT_AVAILABLE")
+                 for sym, tf in SERIES}
+    strategy = {"champions": champions,
+                "registry": {k: {sym: s.strategies.state(k, sym).value for sym in s.universe.symbols}
+                             for k in s.strategies.definitions()} or "NOT_AVAILABLE",
+                "legacy": s.strategies.legacy_records,
                 "candidates": [factory.stages(s, e.payload["fingerprint"])
                                for e in s.research_journal.entries("candidate_lineage")] or "NOT_AVAILABLE"}
 

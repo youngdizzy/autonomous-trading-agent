@@ -104,7 +104,7 @@ class TestDiagnostics:
         assert not list(s.research_journal.entries("holdout_access"))
         assert not list(s.research_journal.entries("holdout_sealed"))
         assert not list(s.research_journal.entries("promotion_decision"))
-        assert set(s.strategies.keys()) - before_keys <= {"trend@v1"}              # only the baseline registered
+        assert set(s.strategies.keys()) - before_keys <= {"trend@v1/1h"}              # only the baseline registered
         design = next(e.payload for e in s.research_journal.entries("experiment_design"))
         assert design["condition"] == condition and design["candidate"] is None
         assert next(e.seq for e in s.research_journal.entries("experiment_design")) < \
@@ -121,7 +121,7 @@ class TestStructural:
         cp, s, _ = research_plane(tmp_path, reply("RESEARCH_REQUEST", designed("H-s-1", exp)))
         out = cp.run_cycle()
         assert out.status == "COMPLETED" and out.detail["research_status"] == "COMPLETED", out.detail
-        assert s.strategies.get("trend@v1").param_dict["fast"] == 10                 # baseline untouched
+        assert s.strategies.get("trend@v1/1h").param_dict["fast"] == 10                 # baseline untouched
         # buy-and-hold trades once per window, so walk-forward cannot select it (>= 5 trades per training window):
         # development evidence is INSUFFICIENT and no candidate is generated — reported, not forced.
         assert out.detail["dev_verdict"] == "INSUFFICIENT_EVIDENCE" and "candidate" not in out.detail
@@ -129,7 +129,7 @@ class TestStructural:
         assert not list(s.research_journal.entries("holdout_access"))
         comp = [e.payload for e in s.research_journal.entries("experiment_comparison")]
         assert len(comp) == 1 and comp[0]["candidate_strategy_id"].startswith("buy_and_hold")
-        assert comp[0]["baseline_strategy_id"] == "trend@v1"
+        assert comp[0]["baseline_strategy_id"] == "trend@v1/1h"
 
     @pytest.mark.parametrize("structure,needle", [({"kind": "ma_crossover", "params": {"fast": 3}}, "different strategy logic"),
                                                   ({"kind": "martingale", "params": {"x": 2}}, "only registered strategy logic")])
@@ -176,7 +176,7 @@ class TestAutonomyAndIdentity:
         assert steps["request_issued"]["context_id"].startswith("ctx_")
         assert steps["action_started"]["context_id"] == steps["request_issued"]["context_id"]
         assert steps["action_started"]["request_id"] == steps["request_issued"]["request_id"]
-        assert "datasets" in steps["action_started"] and "strategy_fingerprint" in steps["action_started"]
+        assert "datasets" in steps["action_started"] and steps["action_started"]["strategy_fingerprints"] == {"BTC/USD 1h": None}
         assert out.status == "COMPLETED"
 
     def test_tampered_learning_journal_fails_persistence_and_blocks_research(self, tmp_path):
@@ -309,7 +309,7 @@ class TestReadiness:
         assert r["DATA"]["category"] == "MOCK" and r["DATA"]["market_evidence"] is False
         assert r["EXECUTION"]["live_trading"] is False and r["EXECUTION"]["mode"] == "PAPER"
         assert r["EXECUTION"]["maximum_autonomy"] == "PAPER_AUTONOMY"
-        assert r["VALIDATION"]["holdout"] == "NOT_RUN" and r["STRATEGY"]["champion"] == "NOT_AVAILABLE"
+        assert r["VALIDATION"]["holdout"] == "NOT_RUN" and set(r["STRATEGY"]["champions"].values()) == {"NOT_AVAILABLE"}
         assert r["LEARNING"]["validated_findings"].startswith("NONE")
         json.dumps(r, default=str)
 

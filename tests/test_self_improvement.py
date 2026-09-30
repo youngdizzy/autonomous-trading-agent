@@ -223,7 +223,7 @@ class TestSingleVariableExperiment:
         assert "promot" in comp[0]["note"] and comp[0]["baseline_replaced"] is False
         for side in ("baseline", "candidate"):
             assert {f"{side}_strategy_id", f"{side}_fingerprint", f"{side}_dataset_identity", f"{side}_result"} <= set(comp[0])
-        assert comp[0]["baseline_strategy_id"] == "trend@v1" and comp[0]["candidate_evidence"] == wf_rows[0]["evidence_hash"]
+        assert comp[0]["baseline_strategy_id"] == "trend@v1/1h" and comp[0]["candidate_evidence"] == wf_rows[0]["evidence_hash"]
         assert comp[0]["baseline_dataset_identity"] == comp[0]["candidate_dataset_identity"] == wf_rows[0]["dataset_id"]
         assert comp[0]["candidate_fingerprint"] and comp[0]["candidate_fingerprint"] != comp[0]["baseline_fingerprint"]
         assert comp[0]["attempts"]["root_hypotheses_tested_before"] == 0
@@ -231,7 +231,7 @@ class TestSingleVariableExperiment:
         assert "wfo_stability" in comp[0]["dimensions"] and comp[0]["not_measured"]
         assert out.detail["comparison"]["conclusion"] == comp[0]["conclusion"]
         # baseline never silently replaced: trend@v1 keeps the baseline params; the candidate is a child version
-        baseline = s.strategies.get("trend@v1")
+        baseline = s.strategies.get("trend@v1/1h")
         assert baseline.param_dict["fast"] == 10 and design["baseline"]["fingerprint"] == baseline.definition_hash
         children = [s.strategies.get(k) for k in s.strategies.keys() if s.strategies.get(k).parent_hash == baseline.definition_hash]
         assert len(children) == 1 and children[0].param_dict["fast"] == 20 and children[0].key != "trend@v1"
@@ -244,7 +244,7 @@ class TestSingleVariableExperiment:
         assert lineage[0]["provenance"]["data_status"] == "MOCK"
         from ati.company import factory
         trail = factory.stages(s, children[0].definition_hash)
-        assert trail["stages"]["CANDIDATE_GENERATED"] == children[0].key and trail["stages"]["WALK_FORWARD"] == "PASS"
+        assert trail["stages"]["CANDIDATE_GENERATED"] == children[0].registry_key and trail["stages"]["WALK_FORWARD"] == "PASS"
         assert trail["stages"]["ADVERSARIAL"] != "NOT_REACHED" and trail["stages"]["PROMOTION_REVIEW"] != "NOT_REACHED"
         assert trail["stages"]["VALIDATION"] == ("APPROVED" if out.detail["promotion_approved"] else "DENIED")
         # the LEARN stage ran for this cycle and learned from the experiment outcome(s)

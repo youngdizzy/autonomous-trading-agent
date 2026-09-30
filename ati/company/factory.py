@@ -104,7 +104,7 @@ def experiment_id(hypothesis_id: str, design_hash: str) -> str:
 
 
 def record_lineage(system, definition, *, hypothesis_id: str, experiment_id: str, dev_dataset_id: str,
-                   full_dataset_id: str, baseline_hash: str | None) -> bool:
+                   full_dataset_id: str, baseline_hash: str | None, protocol=None) -> bool:
     """Idempotent: one lineage record per (fingerprint, hypothesis)."""
     s = system
     for e in s.research_journal.entries("candidate_lineage"):
@@ -112,7 +112,13 @@ def record_lineage(system, definition, *, hypothesis_id: str, experiment_id: str
             return False
     s.research_journal.append("candidate_lineage", {
         "candidate_id": candidate_id(definition.definition_hash, hypothesis_id), "attempts": attempts(s, hypothesis_id),
-        "fingerprint": definition.definition_hash, "key": definition.key, "parent_fingerprint": definition.parent_hash,
+        "fingerprint": definition.definition_hash, "key": definition.registry_key,
+        "strategy_id": definition.strategy_id, "strategy_version": definition.version,
+        "behavior_fingerprint": definition.behavior_fingerprint, "timeframe": definition.timeframe.value,
+        "symbol": protocol.symbol if protocol else None,
+        "protocol_id": protocol.protocol_id if protocol else None,
+        "protocol_hash": protocol.protocol_hash if protocol else None,
+        "parent_fingerprint": definition.parent_hash,
         "baseline_fingerprint": baseline_hash, "hypothesis_id": hypothesis_id, "experiment_id": experiment_id,
         "datasets": {"development": dev_dataset_id, "full": full_dataset_id}, "params": definition.param_dict,
         "code_hash": definition.code_hash, "kind": definition.kind,
@@ -127,10 +133,12 @@ def stages(system, fingerprint: str) -> dict:
     log = ResearchLog(s.research_journal)
     reached: dict[str, str] = {}
     key = None
-    for k in s.strategies.keys():
+    for k in s.strategies.definitions():
         if s.strategies.get(k).definition_hash == fingerprint:
             key = k
             reached["CANDIDATE_GENERATED"] = k
+    # lifecycle state exists per research dimension; legacy lineage without a symbol stays unscoped (not guessed)
+    symbol = next((l_["symbol"] for l_ in lineage if l_.get("symbol")), None)
     hyps = {l["hypothesis_id"] for l in lineage}
     for h in hyps:
         if log.status(h) != "UNKNOWN":
@@ -156,10 +164,13 @@ def stages(system, fingerprint: str) -> dict:
     if promos:
         reached["VALIDATION"] = "APPROVED" if promos[-1]["approved"] else "DENIED"
         reached["PROMOTION_REVIEW"] = "promotion_id " + promotion_id(promos[-1]["record_hash"])
-    if key is not None and any(h[0] == key and h[2] == "CHALLENGER" for h in s.strategies.history):
+    if key is not None and any(h[0] == key and h[2] == "CHALLENGER" and (symbol is None or h[4] == symbol)
+                               for h in s.strategies.history):
         reached["CHALLENGER"] = "entered"
     furthest = max((STAGES.index(k) for k in reached), default=-1)
     return {"fingerprint": fingerprint, "key": key, "lineage": lineage,
-            "registry_state": s.strategies.state(key).value if key else "NOT_AVAILABLE",
+            "symbol": symbol or "LEGACY_UNSCOPED",
+            "registry_state": (s.strategies.state(key, symbol).value if symbol else "LEGACY_UNSCOPED")
+            if key else "NOT_AVAILABLE",
             "stages": {st: reached.get(st, "NOT_REACHED") for st in STAGES},
             "furthest_stage": STAGES[furthest] if furthest >= 0 else "NOT_AVAILABLE"}

@@ -59,29 +59,29 @@ def test_registry_refuses_in_place_modification():
 def test_derive_creates_new_candidate_version_with_lineage():
     reg = StrategyRegistry()
     parent = reg.register(defn())
-    child = reg.derive(parent.key, P | {"fast": 12}, T0, "tweak")
+    child = reg.derive(parent.registry_key, P | {"fast": 12}, T0, "tweak")
     assert child.version == 2 and child.parent_hash == parent.definition_hash
-    assert reg.state(child.key) is Lifecycle.CANDIDATE
-    assert reg.get(parent.key).param_dict["fast"] == 10
+    assert reg.state(child.registry_key, "BTC/USD") is Lifecycle.CANDIDATE
+    assert reg.get(parent.registry_key).param_dict["fast"] == 10
 
 
 def test_champion_cannot_be_set_without_promotion_record():
     reg = StrategyRegistry()
     d = reg.register(defn())
-    reg.transition(d.key, Lifecycle.CHALLENGER, "evaluated")
+    reg.transition(d.registry_key, "BTC/USD", Lifecycle.CHALLENGER, "evaluated")
     with pytest.raises(LifecycleError):
-        reg.transition(d.key, Lifecycle.CHAMPION, "trust me")
+        reg.transition(d.registry_key, "BTC/USD", Lifecycle.CHAMPION, "trust me")
     with pytest.raises(PromotionDenied):
         reg.apply_promotion({"approved": True, "challenger_key": d.key})
-    assert reg.champion() is None
+    assert reg.champion("BTC/USD", Timeframe.H1) is None
 
 
 def test_candidates_are_isolated_from_champion():
     reg = StrategyRegistry()
     d = reg.register(defn())
-    reg.derive(d.key, P | {"slow": 60}, T0, "c")
-    assert reg.champion() is None
-    assert set(reg.keys(Lifecycle.CANDIDATE)) == {"trend@v1", "trend@v2"}
+    reg.derive(d.registry_key, P | {"slow": 60}, T0, "c")
+    assert reg.champion("BTC/USD", Timeframe.H1) is None
+    assert set(reg.keys(Lifecycle.CANDIDATE, "BTC/USD")) == {"trend@v1/1h", "trend@v2/1h"}
 
 
 def test_signal_is_stamped_with_cutoff_and_uses_only_view():

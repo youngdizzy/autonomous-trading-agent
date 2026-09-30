@@ -33,12 +33,13 @@ def make_system(state_dir, *, script=None, seed=11, start_hours=400, provider=No
     return build_paper_system(state_dir, clock, provider, reasoning, data_status=DataStatus.MOCK), clock
 
 
-def install_champion(system, params=FAST):
+def install_champion(system, params=FAST, symbol="BTC/USD", timeframe=Timeframe.H1):
     """TEST-ONLY: promotes through the real gate using stub evidence objects so the paper path can
-    be exercised. The gate itself is unchanged; its decision is journaled like any other."""
+    be exercised. The gate itself is unchanged; its decision is journaled like any other. The champion
+    belongs to one research dimension (symbol, timeframe) — there is no global champion."""
     s = system
-    d = s.strategies.register(StrategyDefinition.create("trend", 1, "ma_crossover", params, Timeframe.H1, s.clock.now()))
-    s.strategies.transition(d.key, Lifecycle.CHALLENGER, "test rig")
+    d = s.strategies.register(StrategyDefinition.create("trend", 1, "ma_crossover", params, timeframe, s.clock.now()))
+    s.strategies.transition(d.registry_key, symbol, Lifecycle.CHALLENGER, "test rig")
     provider = MockProvider(99, FixedClock(T0 + timedelta(hours=1200)), epoch=T0)
     ds = Dataset.build(provider.fetch_candles("BTC/USD", Timeframe.H1, T0, T0 + timedelta(hours=1200)),
                        data_version="rig", realization="rig")
@@ -47,7 +48,7 @@ def install_champion(system, params=FAST):
     adv = AdversarialReport(d.key, d.definition_hash, ds.dataset_id, "MOCK", (Objection("stub", Verdict.PASS, "rig"),))
     hold = HoldoutEvaluation(d.key, d.definition_hash, "ds_rig", "p", replace(wf.oos_metrics, n_trades=50), Verdict.PASS, (), 1)
     record = decide_promotion(d, None, wf, adv, hold, None, PromotionPolicy(allow_mock_evidence=True), s.clock.now(),
-                              s.research_journal)
+                              s.research_journal, symbol=symbol)
     assert record.approved, record.reasons
     s.strategies.apply_promotion(record)
     return d

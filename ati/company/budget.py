@@ -44,7 +44,7 @@ def usage(system, company_journal, now: datetime, baseline_hash: str | None = No
     holdouts = sum(1 for _ in s.research_journal.entries("holdout_access"))
     variants = 0
     if baseline_hash:
-        variants = sum(1 for k in s.strategies.keys() if s.strategies.get(k).parent_hash == baseline_hash)
+        variants = sum(1 for k in s.strategies.definitions() if s.strategies.get(k).parent_hash == baseline_hash)
     today = now.date().isoformat()
     runs_today = sum(1 for e in company_journal.entries("cycle_step")
                      if e.payload["step"] == "research_invoked" and e.at[:10] == today)

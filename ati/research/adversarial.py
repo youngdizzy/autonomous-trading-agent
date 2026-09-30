@@ -145,4 +145,4 @@ def challenge(defn: StrategyDefinition, dev: Dataset, cfg: BacktestConfig, wf: W
                      "Was this hypothesis selected because it happened to work?"):
         o.append(Objection(question, Verdict.NOT_AUTOMATED, "requires adversarial reviewer judgement; recorded, not assumed"))
 
-    return AdversarialReport(defn.key, defn.definition_hash, dev.dataset_id, status.value, tuple(o))
+    return AdversarialReport(defn.registry_key, defn.definition_hash, dev.dataset_id, status.value, tuple(o))

@@ -186,8 +186,9 @@ class TestRegistry:
             assert p.permitted_provenance == ("DELAYED", "HISTORICAL", "REAL")
             assert p.validation_stages == ("walk_forward_oos:PASS", "adversarial:NON_BLOCKING", "holdout:PASS",
                                            "promotion_gate:APPROVED")
+        # Phase 4B: the registry is timeframe-aware, so every protocol resolves to its own deployment
         for pid in ("REAL-PROTOCOL-002", "REAL-PROTOCOL-003", "REAL-PROTOCOL-004"):
-            assert not REGISTRY[pid].executable and "NOT IMPLEMENTED" in REGISTRY[pid].not_executable_reason
+            assert REGISTRY[pid].executable and not REGISTRY[pid].not_executable_reason
 
     def test_identity_is_deterministic_and_material_changes_change_it(self):
         p = REGISTRY["REAL-PROTOCOL-002"]
@@ -200,8 +201,8 @@ class TestRegistry:
         assert REGISTRY["REAL-PROTOCOL-001"].strategy_fingerprint == REGISTRY["REAL-PROTOCOL-003"].strategy_fingerprint
         assert REGISTRY["REAL-PROTOCOL-001"].strategy_fingerprint != REGISTRY["REAL-PROTOCOL-002"].strategy_fingerprint
 
-    def test_non_executable_protocols_cannot_be_requested(self, tmp_path):
-        payload = designed("H-4a-x") | {"protocol_id": "REAL-PROTOCOL-002"}
+    def test_unknown_protocols_cannot_be_requested(self, tmp_path):
+        payload = designed("H-4a-x") | {"protocol_id": "REAL-PROTOCOL-999"}
         cp, s, _ = plane(tmp_path / "st", script={"company": reply("RESEARCH_REQUEST", payload)})
         out = cp.run_cycle()
         assert out.status == "FAILED" and "unknown research protocol" in out.detail["reason"]
@@ -244,8 +245,8 @@ class TestCompatibility:
     def test_strategy_identity_and_fingerprint_enforced(self, system):
         ds = mock_dataset(120)
         p = REGISTRY[P.PROTOCOL_ID]
-        assert any("strategy identity" in r for r in compatibility(p, ds, self.strategy(fast=11), system))
-        assert any("strategy identity" in r for r in compatibility(p, ds, self.strategy(tf=H4), system))
+        assert any("strategy deployment" in r for r in compatibility(p, ds, self.strategy(fast=11), system))
+        assert any("strategy deployment" in r for r in compatibility(p, ds, self.strategy(tf=H4), system))
         child = StrategyDefinition.create("trend", 1, "ma_crossover", P.BASE_PARAMS, H1, T0, parent_hash="x" * 64)
         assert any("fingerprint" in r for r in compatibility(p, ds, child, system))
 
@@ -279,4 +280,4 @@ class TestHoldoutSafety:
         prompt = seen[-1]
         assert seal["holdout_dataset_id"] not in prompt and seal["holdout_commitment"] not in prompt
         assert "protocol_run" not in prompt and "validation_detail" not in prompt
-        assert "REAL-PROTOCOL-002" not in prompt                                  # declared-only protocols are not offered
+        assert "holdout_identity" not in prompt and "SEALED_HOLDOUT" in prompt

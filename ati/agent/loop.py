@@ -134,8 +134,8 @@ class AutonomousLoop:
             report.stopped_at = "DATA"
             return
         marks = self.update_risk_state(report, datasets, now)
-        champion = s.strategies.champion()
         for symbol, ds in datasets.items():
+            champion = s.strategies.champion(symbol, s.timeframe)   # this symbol's champion on this timeframe only
             candidate = self.manage_position(report, symbol, ds, marks, champion)
             if candidate is None:
                 continue

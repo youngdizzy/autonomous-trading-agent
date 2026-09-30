@@ -162,7 +162,11 @@ def research_real(state_dir: Path) -> int:
     from ati.research.protocols import REGISTRY
     proto = REGISTRY[P.PROTOCOL_ID]
     if not ResearchLog(s.research_journal).was_tested(P.HYPOTHESIS_ID):
+        from ati.research.protocols import deployment
         s.research_journal.append("protocol_run", {"protocol_id": proto.protocol_id, "protocol_hash": proto.protocol_hash,
+                                                   **{k: v for k, v in deployment(proto).items()
+                                                      if k not in ("protocol_id", "protocol_hash", "symbol", "timeframe")},
+                                                   "strategy_id": proto.strategy_id, "strategy_version": proto.strategy_version,
                                                    "kind": "validation", "hypothesis_id": P.HYPOTHESIS_ID,
                                                    "experiment_id": None, "symbol": proto.symbol,
                                                    "timeframe": proto.timeframe.value, "dataset_id": full.dataset_id})
@@ -223,14 +227,13 @@ def data_health_cmd(state_dir: Path, data: str) -> int:
     except _AtiError as exc:
         print(f"DATA STATE UNTRUSTWORTHY: {type(exc).__name__}: {exc}")
         return 5
-    champion = s.strategies.champion()
     from ati.market.health import readiness_table
     from ati.research.protocols import REGISTRY
 
     print(json.dumps({"category": s.data_status.value, "provider": s.provider.name,
                       "readiness_table": readiness_table(s, SERIES),
                       "protocols": [p.describe() for p in REGISTRY.values()],
-                      "datasets": scorecard(s, SERIES, champion.definition_hash if champion else None),
+                      "datasets": scorecard(s, SERIES),
                       "sealed_holdouts": verify_sealed_holdouts(s),
                       "open_conflicts": s.archive.conflicts()}, indent=2, default=str))
     return 0

@@ -45,17 +45,17 @@ def _resolve_challenger(registry, base: StrategyDefinition, params: dict, now: d
     candidate = StrategyDefinition.create(base.strategy_id, base.version, base.kind, params, base.timeframe, now,
                                           base.parent_hash, f"selected by walk-forward for {hypothesis_id}")
     try:
-        registered = registry.get(candidate.key)
+        registered = registry.get(candidate.registry_key)
     except KeyError:
         return registry.register(candidate)
     if registered.definition_hash == candidate.definition_hash:
         return registered
-    for key in registry.keys():
+    for key in registry.definitions(candidate.timeframe):
         d = registry.get(key)
         if (d.strategy_id, d.kind, d.timeframe, d.code_hash, d.params) == \
                 (candidate.strategy_id, candidate.kind, candidate.timeframe, candidate.code_hash, candidate.params):
             return d
-    return registry.derive(candidate.key, params, now, f"selected by walk-forward for {hypothesis_id}")
+    return registry.derive(candidate.registry_key, params, now, f"selected by walk-forward for {hypothesis_id}")
 
 
 def research_preconditions(system, full: Dataset, base: StrategyDefinition, *, hypothesis_id: str, min_candles: int,
@@ -132,7 +132,7 @@ def run_research_cycle(system, full: Dataset, boundary: datetime, *, hypothesis_
                         dataset_id=dev.dataset_id)
 
     # observation_refs: what motivated the hypothesis (e.g. learning evidence) — locked into the pre-registration.
-    prereg = PreRegistration(hypothesis_id, statement, tuple(observation_refs), base.key, base.definition_hash,
+    prereg = PreRegistration(hypothesis_id, statement, tuple(observation_refs), base.registry_key, base.definition_hash,
                              dev.dataset_id, criteria,
                              adversarial_policy.min_oos_trades, now)
     log.preregister(prereg)
@@ -154,24 +154,25 @@ def run_research_cycle(system, full: Dataset, boundary: datetime, *, hypothesis_
 
     chosen = Counter(f.selected_params for f in wf.folds if f.selected_params).most_common(1)[0][0]
     challenger = _resolve_challenger(s.strategies, base, dict(chosen), now, hypothesis_id)
-    state = s.strategies.state(challenger.key)
+    symbol = full.identity.symbol                      # the research dimension is (dataset symbol, strategy timeframe)
+    state = s.strategies.state(challenger.registry_key, symbol)
     if state in (Lifecycle.CANDIDATE, Lifecycle.REJECTED):
         why = "survived development" if state is Lifecycle.CANDIDATE else \
             "re-admitted: survived development in a new retest; prior rejection remains in history"
-        s.strategies.transition(challenger.key, Lifecycle.CHALLENGER, f"{why} for {hypothesis_id}")
+        s.strategies.transition(challenger.registry_key, symbol, Lifecycle.CHALLENGER, f"{why} for {hypothesis_id}")
     elif state is not Lifecycle.CHALLENGER:
         # CHAMPION / RETIRED have no legal path through challenger evaluation in this workflow. Stop before
         # the holdout is consumed; the development experiment above is already recorded.
-        reason = f"{challenger.key} is {state.value}; not eligible for challenger evaluation (holdout not used)"
+        reason = f"{challenger.registry_key} is {state.value} for {symbol}; not eligible for challenger evaluation (holdout not used)"
         journal.append("research_note", {"hypothesis_id": hypothesis_id, "note": reason})
-        return CycleResult(hypothesis_id, dev_verdict, challenger.key, None, None, None, None, "COMPLETED", (reason,))
+        return CycleResult(hypothesis_id, dev_verdict, challenger.registry_key, None, None, None, None, "COMPLETED", (reason,))
 
     adv = challenge(challenger, dev, config, wf, log.hypotheses_tested, adversarial_policy)
     s.evidence.register("adversarial", adv.evidence_hash, now, "adversarial challenge",
                         dataset_id=adv.dataset_id, strategy=challenger.definition_hash)
     journal.append("adversarial_report", {"report": adv, "evidence_hash": adv.evidence_hash})
 
-    hold_prereg = PreRegistration(hypothesis_id + ":holdout", statement, tuple(observation_refs), challenger.key,
+    hold_prereg = PreRegistration(hypothesis_id + ":holdout", statement, tuple(observation_refs), challenger.registry_key,
                                   challenger.definition_hash,
                                   dev.dataset_id, criteria, promotion_policy.min_holdout_trades, now)
     log.preregister(hold_prereg)
@@ -180,8 +181,8 @@ def run_research_cycle(system, full: Dataset, boundary: datetime, *, hypothesis_
                         dataset_id=hold.holdout_dataset_id, strategy=challenger.definition_hash)
     log.record_experiment(hold_prereg.hypothesis_id, "holdout", hold.evidence_hash, hold.metrics, hold.holdout_dataset_id)
 
-    champion = s.strategies.champion()
-    record = decide_promotion(challenger, champion, wf, adv, hold, None, promotion_policy, now, journal)
+    champion = s.strategies.champion(symbol, challenger.timeframe)   # only this dimension's champion is comparable
+    record = decide_promotion(challenger, champion, wf, adv, hold, None, promotion_policy, now, journal, symbol=symbol)
     s.evidence.register("promotion", record.record_hash, now, "approved" if record.approved else "denied")
     refs = [wf.evidence_hash, adv.evidence_hash, hold.evidence_hash]
     if record.approved:
@@ -192,7 +193,7 @@ def run_research_cycle(system, full: Dataset, boundary: datetime, *, hypothesis_
         else:
             mid = remember(MemoryKind.VALIDATED_FINDING, statement, refs, 0.6)
     else:
-        s.strategies.transition(challenger.key, Lifecycle.REJECTED, "; ".join(record.reasons)[:300])
+        s.strategies.transition(challenger.registry_key, symbol, Lifecycle.REJECTED, "; ".join(record.reasons)[:300])
         mid = remember(MemoryKind.REJECTED_HYPOTHESIS, f"{statement} — promotion denied: {'; '.join(record.reasons)}"[:1900],
                        refs, 0.8)
-    return CycleResult(hypothesis_id, dev_verdict, challenger.key, adv.blocking, hold.verdict, record, mid)
+    return CycleResult(hypothesis_id, dev_verdict, challenger.registry_key, adv.blocking, hold.verdict, record, mid)

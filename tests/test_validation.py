@@ -144,17 +144,17 @@ class TestPromotion:
     def test_approved_path_and_registry_application(self, full, journal):
         reg = StrategyRegistry(journal)
         c = reg.register(trend())
-        reg.transition(c.key, Lifecycle.CHALLENGER, "ready")
+        reg.transition(c.registry_key, "BTC/USD", Lifecycle.CHALLENGER, "ready")
         wf, adv, hold = _evidence(c, full)
-        rec = decide_promotion(c, None, wf, adv, hold, None, PromotionPolicy(), T0, journal)
+        rec = decide_promotion(c, None, wf, adv, hold, None, PromotionPolicy(), T0, journal, symbol="BTC/USD")
         assert rec.approved, rec.reasons
         reg.apply_promotion(rec)
-        assert reg.champion().key == c.key
+        assert reg.champion("BTC/USD", Timeframe.H1).key == c.key
 
     def test_denials_are_recorded_not_hidden(self, full, journal):
         c = trend()
         wf, adv, hold = _evidence(c, full, verdict=Verdict.FAIL)
-        rec = decide_promotion(c, None, wf, adv, hold, None, PromotionPolicy(), T0, journal)
+        rec = decide_promotion(c, None, wf, adv, hold, None, PromotionPolicy(), T0, journal, symbol="BTC/USD")
         assert not rec.approved
         recorded = [e.payload["record"] for e in journal.entries("promotion_decision")]
         assert recorded and recorded[-1]["approved"] is False
@@ -167,30 +167,30 @@ class TestPromotion:
     def test_denial_reasons(self, full, journal, kwargs, needle):
         c = trend()
         wf, adv, hold = _evidence(c, full, **kwargs)
-        rec = decide_promotion(c, None, wf, adv, hold, None, PromotionPolicy(), T0, journal)
+        rec = decide_promotion(c, None, wf, adv, hold, None, PromotionPolicy(), T0, journal, symbol="BTC/USD")
         assert not rec.approved and any(needle in r for r in rec.reasons)
 
     def test_evidence_for_other_strategy_rejected(self, full, journal):
         c, other = trend(), trend(fast=11)
         wf, adv, hold = _evidence(other, full)
-        rec = decide_promotion(c, None, wf, adv, hold, None, PromotionPolicy(), T0, journal)
+        rec = decide_promotion(c, None, wf, adv, hold, None, PromotionPolicy(), T0, journal, symbol="BTC/USD")
         assert not rec.approved
 
     def test_denied_record_cannot_be_applied(self, full, journal):
         reg = StrategyRegistry()
         c = reg.register(trend())
-        reg.transition(c.key, Lifecycle.CHALLENGER, "x")
+        reg.transition(c.registry_key, "BTC/USD", Lifecycle.CHALLENGER, "x")
         wf, adv, hold = _evidence(c, full, verdict=Verdict.FAIL)
-        rec = decide_promotion(c, None, wf, adv, hold, None, PromotionPolicy(), T0, journal)
+        rec = decide_promotion(c, None, wf, adv, hold, None, PromotionPolicy(), T0, journal, symbol="BTC/USD")
         with pytest.raises(PromotionDenied):
             reg.apply_promotion(rec)
 
     def test_tampered_record_cannot_be_applied(self, full, journal):
         reg = StrategyRegistry()
         c = reg.register(trend())
-        reg.transition(c.key, Lifecycle.CHALLENGER, "x")
+        reg.transition(c.registry_key, "BTC/USD", Lifecycle.CHALLENGER, "x")
         wf, adv, hold = _evidence(c, full, verdict=Verdict.FAIL)
-        rec = decide_promotion(c, None, wf, adv, hold, None, PromotionPolicy(), T0, journal)
+        rec = decide_promotion(c, None, wf, adv, hold, None, PromotionPolicy(), T0, journal, symbol="BTC/USD")
         forged = replace(rec, approved=True)
         with pytest.raises(PromotionDenied):
             reg.apply_promotion(forged)
@@ -198,13 +198,13 @@ class TestPromotion:
     def test_challenger_must_beat_champion_like_for_like(self, full, journal):
         reg = StrategyRegistry()
         champ = reg.register(trend("champ"))
-        reg.transition(champ.key, Lifecycle.CHALLENGER, "x")
+        reg.transition(champ.registry_key, "BTC/USD", Lifecycle.CHALLENGER, "x")
         wf0, adv0, h0 = _evidence(champ, full)
-        reg.apply_promotion(decide_promotion(champ, None, wf0, adv0, h0, None, PromotionPolicy(), T0, journal))
+        reg.apply_promotion(decide_promotion(champ, None, wf0, adv0, h0, None, PromotionPolicy(), T0, journal, symbol="BTC/USD"))
         chal = reg.register(trend("chal"))
-        reg.transition(chal.key, Lifecycle.CHALLENGER, "x")
+        reg.transition(chal.registry_key, "BTC/USD", Lifecycle.CHALLENGER, "x")
         wf, adv, hold = _evidence(chal, full)
         champ_wf = replace(wf0, oos_metrics=replace(wf0.oos_metrics, net_pnl=wf.oos_metrics.net_pnl + 1))
-        rec = decide_promotion(chal, champ, wf, adv, hold, champ_wf, PromotionPolicy(), T0, journal)
+        rec = decide_promotion(chal, champ, wf, adv, hold, champ_wf, PromotionPolicy(), T0, journal, symbol="BTC/USD")
         assert not rec.approved and any("beat champion" in r for r in rec.reasons)
-        assert reg.champion().key == champ.key
+        assert reg.champion("BTC/USD", Timeframe.H1).key == champ.key

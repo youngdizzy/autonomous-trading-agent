@@ -46,11 +46,13 @@ def report(cp, day: datetime | None = None) -> dict:
                "cycles_total": len(ends), "cycles_today": len(today), "cycles_by_status": by_status or "NONE",
                "blocked_or_failed_reasons": dict(sorted(blocked.items(), key=lambda kv: -kv[1])[:8]) or "NONE"}
 
-    champion = s.strategies.champion()
-    strategy = {"champion": champion.key if champion else "NONE",
-                "fingerprint": champion.definition_hash if champion else "NOT_AVAILABLE",
-                "challenger_count": len(s.strategies.keys(Lifecycle.CHALLENGER)),
-                "rejected_strategies": len(s.strategies.keys(Lifecycle.REJECTED))}
+    from ati.market.accumulate import SERIES
+
+    strategy = {"champions": {f"{sym} {tf.value}": ({"key": c.registry_key, "fingerprint": c.definition_hash}
+                                                    if (c := s.strategies.champion(sym, tf)) else "NONE")
+                              for sym, tf in SERIES},
+                "challenger_count": {sym: len(s.strategies.keys(Lifecycle.CHALLENGER, sym)) for sym in s.universe.symbols},
+                "rejected_strategies": {sym: len(s.strategies.keys(Lifecycle.REJECTED, sym)) for sym in s.universe.symbols}}
 
     try:
         log = ResearchLog(s.research_journal)

@@ -58,7 +58,7 @@ def entries(s, type_):
 
 
 def history(s, key):
-    return [(f, t) for k, f, t, _ in s.strategies.history if k == key]
+    return [(f, t) for k, f, t, _, _ in s.strategies.history if k == key]
 
 
 def trials(s):
@@ -73,7 +73,7 @@ def rejected(tmp_path):
     state = tmp_path / "st"
     s, r1 = cycle(state, 1, "H1")
     assert r1.status == "COMPLETED" and not r1.promotion.approved
-    assert s.strategies.state(r1.challenger_key) is Lifecycle.REJECTED
+    assert s.strategies.state(r1.challenger_key, "BTC/USD") is Lifecycle.REJECTED
     lines = (state / "research.jsonl").read_bytes().splitlines(keepends=True)
     return state, r1, s.strategies.get(r1.challenger_key).definition_hash, lines
 
@@ -96,9 +96,9 @@ class TestRetest:
         state, r1, h1_hash, _ = rejected
         s2, r2 = cycle(state, 2, "H2", grid=(P | {"fast": 5},))
         new = s2.strategies.get(r2.challenger_key)
-        assert r2.challenger_key == "trend@v2" and new.definition_hash != h1_hash
+        assert r2.challenger_key == "trend@v2/1h" and new.definition_hash != h1_hash
         assert new.parent_hash == h1_hash and new.param_dict["fast"] == 5
-        assert s2.strategies.state(r1.challenger_key) is Lifecycle.REJECTED        # v1 untouched
+        assert s2.strategies.state(r1.challenger_key, "BTC/USD") is Lifecycle.REJECTED        # v1 untouched
         assert history(s2, r1.challenger_key) == [("-", "CANDIDATE"), ("CANDIDATE", "CHALLENGER"), ("CHALLENGER", "REJECTED")]
 
     def test_prior_rejection_stays_and_history_shows_readmission(self, rejected):             # 3, 12
@@ -107,7 +107,7 @@ class TestRetest:
         key = r1.challenger_key
         assert history(s2, key) == [("-", "CANDIDATE"), ("CANDIDATE", "CHALLENGER"), ("CHALLENGER", "REJECTED"),
                                     ("REJECTED", "CHALLENGER"), ("CHALLENGER", "REJECTED")]
-        reasons = [r for k, f, t, r in s2.strategies.history if k == key and f == "REJECTED"]
+        reasons = [r for k, f, t, r, _ in s2.strategies.history if k == key and f == "REJECTED"]
         assert reasons and "re-admitted" in reasons[0] and "H2" in reasons[0]
         decisions = entries(s2, "promotion_decision")
         assert [d["record"]["record_hash"] for d in decisions][0] == r1.promotion.record_hash
@@ -204,14 +204,14 @@ class TestCrashRecovery:
             cycle(state, 2, "H2")
         monkeypatch.undo()
         s = system(state)
-        assert s.strategies.state(r1.challenger_key) is Lifecycle.CHALLENGER   # re-admitted, never finalized
+        assert s.strategies.state(r1.challenger_key, "BTC/USD") is Lifecycle.CHALLENGER   # re-admitted, never finalized
         log = ResearchLog(s.research_journal)
         assert log.status("H2") == "TESTED:PASS" and log.status("H2:holdout").startswith("TESTED:")
         n = len(log.experiments)
         _, rerun = cycle(state, 4, "H2")
         assert rerun.status == "NOT_RUN" and len(ResearchLog(system(state).research_journal).experiments) == n
         s3, r3 = cycle(state, 3, "H3")                       # a new hypothesis finalizes from CHALLENGER
-        assert r3.status == "COMPLETED" and s3.strategies.state(r1.challenger_key) is Lifecycle.REJECTED
+        assert r3.status == "COMPLETED" and s3.strategies.state(r1.challenger_key, "BTC/USD") is Lifecycle.REJECTED
         assert ResearchLog(s3.research_journal).hypotheses_tested == 3
 
 
@@ -225,7 +225,7 @@ class TestIneligibleStates:
         assert r.status == "COMPLETED" and r.holdout_verdict is None and r.promotion is None
         assert "CHAMPION" in r.reasons[0] and "holdout not used" in r.reasons[0]
         assert len(entries(s, "holdout_access")) == holdout_before
-        assert s.strategies.champion().key == champ.key
+        assert s.strategies.champion("BTC/USD", Timeframe.H1).key == champ.key
 
 
 class TestMemoryUnaffected:

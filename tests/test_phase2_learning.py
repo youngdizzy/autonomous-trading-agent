@@ -122,7 +122,7 @@ class TestLearning:
 
     def test_B_learning_candidate_preserves_provenance(self, traded):
         cp, s, _ = traded
-        champion = s.strategies.champion()
+        champion = s.strategies.champion("BTC/USD", Timeframe.H1)
         c = next(c for c in cp.learning.candidates.values() if c.pattern in ("REPEATED_LOSS", "REGIME_FAILURE",
                                                                              "UNEXPECTED_COSTS", "DRAWDOWN_CLUSTER")
                  or cp.learning.outcomes[c.evidence[0]].source == "trade")
@@ -233,7 +233,7 @@ class TestResearch:
 
     def test_I_baseline_is_immutable(self, researched):
         cp, s, _, _ = researched
-        baseline = s.strategies.get("trend@v1")
+        baseline = s.strategies.get("trend@v1/1h")
         assert baseline.param_dict == {"fast": 10, "slow": 50, "atr_period": 14, "stop_atr": 3.0}
         with pytest.raises(StrategyImmutableError):
             s.strategies.register(StrategyDefinition.create("trend", 1, "ma_crossover", {"fast": 20, "slow": 50,
@@ -248,7 +248,7 @@ class TestResearch:
         b = StrategyDefinition.create("trend", 2, "ma_crossover", dict(reversed(list(params.items()))), Timeframe.H1, T0, "p")
         assert a.definition_hash == b.definition_hash
         fp = out.detail["candidate"]["fingerprint"]
-        assert cp._registered_with(s.strategies.get("trend@v1"), params).definition_hash == fp   # same params → same def
+        assert cp._registered_with(s.strategies.get("trend@v1/1h"), params).definition_hash == fp   # same params → same def
         assert out.detail["candidate"]["candidate_id"] == factory.candidate_id(fp, "H-p2-R")
 
     def test_K_candidate_lineage_preserved_across_restart(self, researched, tmp_path):
@@ -258,7 +258,7 @@ class TestResearch:
         after = [e.payload for e in s2.research_journal.entries("candidate_lineage")]
         assert before == after and len(after) == 1
         l_ = after[0]
-        assert l_["parent_fingerprint"] == s2.strategies.get("trend@v1").definition_hash
+        assert l_["parent_fingerprint"] == s2.strategies.get("trend@v1/1h").definition_hash
         assert {"candidate_id", "fingerprint", "hypothesis_id", "experiment_id", "datasets", "params", "code_hash",
                 "provenance", "attempts"} <= set(l_)
         assert factory.stages(s2, l_["fingerprint"]) == factory.stages(s, l_["fingerprint"])
@@ -270,7 +270,7 @@ class TestResearch:
         assert [e for e in log.experiments if e["hypothesis_id"].startswith("H-p2-R")]
         key = out.detail["candidate"]["key"]
         if not out.detail["promotion_approved"]:
-            assert s2.strategies.state(key) is Lifecycle.REJECTED
+            assert s2.strategies.state(key, "BTC/USD") is Lifecycle.REJECTED
             assert any(h[0] == key and h[2] == "REJECTED" for h in s2.strategies.history)
         rep = intelligence_report(cp2)
         assert rep["RESEARCH"]["experiments"] == len(log.experiments) and rep["RESEARCH"]["failed_experiments"] >= 1
@@ -292,7 +292,7 @@ class TestResearch:
 # --- Validation O–S ------------------------------------------------------------------------------------------------------
 def gate_inputs(s):
     d = s.strategies.register(StrategyDefinition.create("trend", 1, "ma_crossover", FAST, Timeframe.H1, s.clock.now()))
-    s.strategies.transition(d.key, Lifecycle.CHALLENGER, "test")
+    s.strategies.transition(d.registry_key, "BTC/USD", Lifecycle.CHALLENGER, "test")
     provider = MockProvider(99, FixedClock(T0 + timedelta(hours=1200)), epoch=T0)
     ds = Dataset.build(provider.fetch_candles("BTC/USD", Timeframe.H1, T0, T0 + timedelta(hours=1200)),
                        data_version="rig", realization="rig")
@@ -307,7 +307,8 @@ class TestValidation:
     POLICY = PromotionPolicy(allow_mock_evidence=True)
 
     def decide(self, s, d, wf, adv, hold):
-        return decide_promotion(d, None, wf, adv, hold, None, self.POLICY, s.clock.now(), s.research_journal)
+        return decide_promotion(d, None, wf, adv, hold, None, self.POLICY, s.clock.now(), s.research_journal,
+                                symbol="BTC/USD")
 
     def test_O_cannot_bypass_walk_forward(self, tmp_path):
         _, s, _ = plane(tmp_path / "st")
@@ -328,7 +329,7 @@ class TestValidation:
         r = self.decide(s, d, wf, replace(adv, strategy_hash="someone_else"), hold)
         assert not r.approved and any("does not belong" in x for x in r.reasons)
         with pytest.raises(LifecycleError):                           # and no lifecycle side door to CHAMPION
-            s.strategies.transition(d.key, Lifecycle.CHAMPION, "skip the gate")
+            s.strategies.transition(d.registry_key, "BTC/USD", Lifecycle.CHAMPION, "skip the gate")
 
     def test_R_cannot_bypass_holdout(self, tmp_path):
         _, s, _ = plane(tmp_path / "st")
@@ -337,7 +338,7 @@ class TestValidation:
         assert not r.approved and any("holdout verdict" in x for x in r.reasons)
         with pytest.raises(PromotionDenied):
             s.strategies.apply_promotion(r)
-        assert s.strategies.champion() is None
+        assert s.strategies.champion("BTC/USD", Timeframe.H1) is None
 
     def test_S_holdout_result_cannot_modify_or_rerun_the_candidate(self, researched, tmp_path):
         cp, s, clock, out = researched
@@ -478,7 +479,7 @@ class TestRecovery:
         assert len(stages) == len(set(stages))                     # no experiment duplicated
         assert sum(1 for _ in s3.research_journal.entries("holdout_access")) <= 1      # holdout never consumed twice
         assert sum(1 for _ in s3.research_journal.entries("promotion_decision")) <= 1
-        assert s3.strategies.champion() is None                     # never silently promoted
+        assert s3.strategies.champion("BTC/USD", Timeframe.H1) is None                     # never silently promoted
         assert replay.status == "BLOCKED" and "already registered" in replay.detail["reason"]
         assert {n: len(list(s3.research_journal.entries(n))) for n in sizes} == sizes
         no_duplicates(cp3)
@@ -512,7 +513,7 @@ class TestRecovery:
         assert out.detail["recovered"] and len(list(s.research_journal.entries("promotion_decision"))) == 1
         assert "requires_review" in out.detail                   # reported, never applied or reversed by recovery
         key = out.detail["candidate"]["key"]
-        assert s.strategies.state(key) is Lifecycle.CHALLENGER
+        assert s.strategies.state(key, "BTC/USD") is Lifecycle.CHALLENGER
 
     def test_Z9_crash_before_candidate_persistence(self, tmp_path, monkeypatch):
         out, s, log = self.research_crash(tmp_path, monkeypatch, factory, "record_lineage")
@@ -635,5 +636,6 @@ class TestIntelligenceReport:
         assert r["TRADING"]["paper_trades_closed"] >= 2
         assert r["TRADING"]["wins"] + r["TRADING"]["losses"] == r["TRADING"]["paper_trades_closed"]
         assert r["TRADING"]["profitability"].startswith("INSUFFICIENT_EVIDENCE")
-        assert r["STRATEGY"]["fingerprint"] == s.strategies.champion().definition_hash
+        assert r["STRATEGY"]["champions"]["BTC/USD 1h"]["fingerprint"] == \
+            s.strategies.champion("BTC/USD", Timeframe.H1).definition_hash
         json.dumps(r, default=str)

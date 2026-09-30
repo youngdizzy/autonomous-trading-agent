@@ -16,10 +16,10 @@ A protocol's identity (``protocol_hash``) is the hash of every material requirem
 produces a different identity, so a protocol can never be silently mutated under an old id. Research runs record
 the id *and* hash they ran under (``protocol_run`` in the research journal).
 
-Executability is a *state*, not a requirement, and is reported honestly: only REAL-PROTOCOL-001 can be routed by
-the company control plane today. The others are declared, not executable — the strategy registry keys
-definitions by ``strategy_id@version`` (so ``trend@v1`` cannot exist on both 1h and 4h) and the champion
-registry is single-series. The registry describes what WOULD be required; it does not pretend otherwise.
+Executability is a *state*, not a requirement (it is excluded from the identity hash). Since Phase 4B the
+strategy registry keys definitions by ``strategy_id@vN/<timeframe>`` and scopes lifecycle/champion state by
+research dimension, so every protocol resolves to its own timeframe deployment and all four are routable. That
+says nothing about data: without REAL candles every protocol is still REAL_DATA_UNAVAILABLE.
 
 Holdout: protocols state that a sealed holdout is required and how large it is. They never carry holdout
 identities, candles, outcomes or metrics.
@@ -88,6 +88,8 @@ class ResearchProtocol:
                 "timeframe": self.timeframe.value, "hypothesis_id": self.hypothesis_id, "statement": self.statement,
                 "strategy": {"strategy_id": self.strategy_id, "version": self.strategy_version, "kind": self.strategy_kind,
                              "params": dict(self.base_params), "fingerprint": self.strategy_fingerprint,
+                             "registry_key": self.strategy.registry_key,
+                             "behavior_fingerprint": self.strategy.behavior_fingerprint,
                              "code_hash": self.strategy.code_hash},
                 "min_real_candles": self.min_candles,
                 "development_holdout": {"holdout_fraction": self.holdout_fraction, "train_bars": self.train_bars,
@@ -121,20 +123,42 @@ def _protocol(protocol_id: str, hypothesis_id: str, symbol: str, timeframe: Time
         executable=executable, not_executable_reason=reason)
 
 
-_NOT_EXECUTABLE = ("declared only: the strategy registry keys definitions by strategy_id@version and the champion "
-                   "registry is single-series, so the company control plane routes research only for "
-                   f"{P.PROTOCOL_ID}; executing this protocol needs a reviewed registry extension (NOT IMPLEMENTED)")
-
 REGISTRY: dict[str, ResearchProtocol] = {p.protocol_id: p for p in (
     _protocol(P.PROTOCOL_ID, P.HYPOTHESIS_ID, P.SYMBOL, P.TIMEFRAME, True),
-    _protocol("REAL-PROTOCOL-002", "H-trend-real-002", "BTC/USD", Timeframe.H4, False, _NOT_EXECUTABLE),
-    _protocol("REAL-PROTOCOL-003", "H-trend-real-003", "ETH/USD", Timeframe.H1, False, _NOT_EXECUTABLE),
-    _protocol("REAL-PROTOCOL-004", "H-trend-real-004", "ETH/USD", Timeframe.H4, False, _NOT_EXECUTABLE),
+    _protocol("REAL-PROTOCOL-002", "H-trend-real-002", "BTC/USD", Timeframe.H4, True),
+    _protocol("REAL-PROTOCOL-003", "H-trend-real-003", "ETH/USD", Timeframe.H1, True),
+    _protocol("REAL-PROTOCOL-004", "H-trend-real-004", "ETH/USD", Timeframe.H4, True),
 )}
+
+
+def deployment(protocol: ResearchProtocol) -> dict:
+    """Research deployment identity: the strategy on this protocol's timeframe, evaluated on its symbol."""
+    s = protocol.strategy
+    return {"registry_key": s.registry_key, "strategy_fingerprint": s.definition_hash,
+            "behavior_fingerprint": s.behavior_fingerprint, "symbol": protocol.symbol,
+            "timeframe": protocol.timeframe.value, "protocol_id": protocol.protocol_id,
+            "protocol_hash": protocol.protocol_hash}
 
 
 def for_series(symbol: str, timeframe: Timeframe) -> ResearchProtocol | None:
     return next((p for p in REGISTRY.values() if (p.symbol, p.timeframe) == (symbol, timeframe)), None)
+
+
+def identity_mismatches(protocol: ResearchProtocol, symbol: str, timeframe, strategy: StrategyDefinition) -> list[str]:
+    """Identity layer only: does (symbol, timeframe, strategy deployment) belong to this protocol? Evidence
+    (provenance, candle count, health, holdout) is checked separately by ``compatibility``."""
+    reasons: list[str] = []
+    if symbol != protocol.symbol:
+        reasons.append(f"symbol {symbol} ≠ protocol {protocol.symbol}")
+    if getattr(timeframe, "value", None) is None or timeframe is not protocol.timeframe:
+        reasons.append(f"timeframe {getattr(timeframe, 'value', timeframe)} ≠ protocol {protocol.timeframe.value}")
+    expected = protocol.strategy
+    if (strategy.strategy_id, strategy.version, strategy.kind, strategy.params, strategy.timeframe) != \
+            (expected.strategy_id, expected.version, expected.kind, expected.params, expected.timeframe):
+        reasons.append("strategy deployment does not match the protocol (identity or timeframe differs)")
+    elif strategy.code_hash != expected.code_hash or strategy.definition_hash != protocol.strategy_fingerprint:
+        reasons.append("strategy fingerprint does not match the protocol (logic source or lineage differs)")
+    return reasons
 
 
 def compatibility(protocol: ResearchProtocol, dataset, strategy: StrategyDefinition, system) -> list[str]:
@@ -142,18 +166,8 @@ def compatibility(protocol: ResearchProtocol, dataset, strategy: StrategyDefinit
     against the payload archive — the dataset's own label, or any caller string, is never taken as proof."""
     from ati.market.health import series_health, verify_sealed_holdouts
 
-    reasons: list[str] = []
     ident = dataset.identity
-    if ident.symbol != protocol.symbol:
-        reasons.append(f"symbol {ident.symbol} ≠ protocol {protocol.symbol}")
-    if ident.timeframe is not protocol.timeframe:
-        reasons.append(f"timeframe {ident.timeframe.value} ≠ protocol {protocol.timeframe.value}")
-    expected = protocol.strategy
-    if (strategy.strategy_id, strategy.version, strategy.kind, strategy.params, strategy.timeframe) != \
-            (expected.strategy_id, expected.version, expected.kind, expected.params, expected.timeframe):
-        reasons.append("strategy identity does not match the protocol's reference strategy")
-    elif strategy.code_hash != expected.code_hash or strategy.definition_hash != protocol.strategy_fingerprint:
-        reasons.append("strategy fingerprint does not match the protocol (logic source or lineage differs)")
+    reasons: list[str] = identity_mismatches(protocol, ident.symbol, ident.timeframe, strategy)
     if ident.status.value not in protocol.permitted_provenance:
         reasons.append(f"provenance {ident.status.value} is not permitted (requires {list(protocol.permitted_provenance)})")
     else:

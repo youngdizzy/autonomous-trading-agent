@@ -262,7 +262,7 @@ def research_readiness(system, symbol: str, tf: Timeframe, health: dict, min_can
                      "validation_detail": validation}
 
 
-def scorecard(system, series, champion_fingerprint: str | None = None) -> list[dict]:
+def scorecard(system, series) -> list[dict]:
     """Phase-13 dataset scorecard (read-only), one row per accumulated series."""
     from ati.market.accumulate import history
     from ati.research import protocol as P
@@ -290,8 +290,8 @@ def scorecard(system, series, champion_fingerprint: str | None = None) -> list[d
             "sealed_holdout_candles": holdout_n,
             "dataset_hash": ds_id or "NOT_AVAILABLE",
             "strategy_fingerprint": {"protocol_reference": proto.strategy_fingerprint if proto else "NO_PROTOCOL_DECLARED",
-                                     "champion": champion_fingerprint if (symbol, tf) == (P.SYMBOL, P.TIMEFRAME)
-                                     and champion_fingerprint else "NO_CHAMPION"},
+                                     "champion": c.definition_hash if (c := s.strategies.champion(symbol, tf))
+                                     else "NO_CHAMPION"},
             "protocol": proto.protocol_id if proto else "NO_PROTOCOL_DECLARED",
             "first_accumulation": runs[0]["at"].isoformat() if runs else "NOT_RUN",
             "latest_accumulation": {"at": runs[-1]["at"].isoformat(), "status": runs[-1]["status"]} if runs else "NOT_RUN",

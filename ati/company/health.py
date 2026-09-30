@@ -118,8 +118,8 @@ def assess(system, loop, datasets: dict, company_journal: Journal, paused: bool,
     # --- data -------------------------------------------------------------------------------------
     market = s.data_status in MARKET_EVIDENCE_STATUSES
     err = getattr(loop, "last_data_error", None)
-    champion = s.strategies.champion()
-    need_bars = champion.lookback if champion else 1
+    champions = [c for sym in s.symbols if (c := s.strategies.champion(sym, s.timeframe)) is not None]
+    need_bars = max((c.lookback for c in champions), default=1)
     categories = {c.status for sym in s.symbols for c in s.store.series(s.provider.name, sym, s.timeframe)}
     historical = s.archive.conflicts()
     if conflicts is not None and conflicts.open:

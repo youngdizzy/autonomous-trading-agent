@@ -14,6 +14,7 @@ from ati.core.types import Side
 from ati.decision.records import FinalDecision
 from ati.execution.broker import OrderStatus
 from ati.market.mock import MockProvider
+from ati.market.models import Timeframe
 from ati.risk.engine import ReconState
 from tests.helpers import T0
 from tests.rig import entered, install_champion, make_system, packet, run_until, script_with
@@ -260,7 +261,7 @@ def test_process_restart_after_fill(tmp_path):
     # new process: new objects, new approval key, same durable state
     s2, _ = make_system(state, clock=clock, provider=s.provider)
     assert s2.execution.account.position_qty("BTC/USD") == qty
-    assert s2.strategies.champion().key == s.strategies.champion().key
+    assert s2.strategies.champion("BTC/USD", Timeframe.H1).key == s.strategies.champion("BTC/USD", Timeframe.H1).key
     loop2 = AutonomousLoop(s2)
     assert loop2.stops["BTC/USD"] == stop and loop2.ticks == loop.ticks
     clock.advance(timedelta(hours=1))

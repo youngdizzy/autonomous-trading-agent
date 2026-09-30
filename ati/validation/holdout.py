@@ -102,7 +102,7 @@ class HoldoutVault:
             raise HoldoutViolation(f"lineage {strategy.lineage_root} has already seen this holdout")
         number = self._evaluations + 1
         # Write-ahead: the access is recorded before any holdout computation happens.
-        self._journal.append("holdout_access", {"strategy_key": strategy.key, "strategy_hash": strategy.definition_hash,
+        self._journal.append("holdout_access", {"strategy_key": strategy.registry_key, "strategy_hash": strategy.definition_hash,
                                                 "prereg_hash": prereg.prereg_hash, "evaluation_number": number})
         self._evaluations = number
         self._evaluated_lineages.add(strategy.lineage_root)
@@ -115,7 +115,7 @@ class HoldoutVault:
         result.trades[:] = [t for t in result.trades if t.decided_at >= hold.identity.start]
         metrics = compute_metrics(result, strategy.timeframe.bars_per_year)
         verdict, details = prereg.evaluate(metrics)
-        evaluation = HoldoutEvaluation(strategy.key, strategy.definition_hash, hold.dataset_id, prereg.prereg_hash,
+        evaluation = HoldoutEvaluation(strategy.registry_key, strategy.definition_hash, hold.dataset_id, prereg.prereg_hash,
                                        metrics, verdict, tuple(tuple(d) for d in details), number)
         self._journal.append("holdout_result", {"evaluation": evaluation, "evidence_hash": evaluation.evidence_hash})
         return evaluation

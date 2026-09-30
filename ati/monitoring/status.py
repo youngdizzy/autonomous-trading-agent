@@ -52,9 +52,10 @@ def build_status(system, loop=None) -> dict:
             "current_hypothesis": decode(preregs[-1].payload)["prereg"]["statement"] if preregs else None,
             "latest_experiment": ({k: decode(experiments[-1].payload)[k] for k in ("hypothesis_id", "stage", "verdict")}
                                   if experiments else None),
-            "champion": (c.key if (c := s.strategies.champion()) else None),
-            "challengers": s.strategies.keys(Lifecycle.CHALLENGER),
-            "rejected": s.strategies.keys(Lifecycle.REJECTED),
+            "champions": {f"{sym} {s.timeframe.value}": (c.registry_key if (c := s.strategies.champion(sym, s.timeframe))
+                                                         else None) for sym in s.symbols},
+            "challengers": {sym: s.strategies.keys(Lifecycle.CHALLENGER, sym) for sym in s.symbols},
+            "rejected": {sym: s.strategies.keys(Lifecycle.REJECTED, sym) for sym in s.symbols},
             "memory_entries": len(s.memory),
         },
         "safety": {

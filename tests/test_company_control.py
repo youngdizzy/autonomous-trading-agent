@@ -53,6 +53,7 @@ def reply(action, payload=None, reason="concise reason", **envelope):
 
 def trade_payload(p, **over):
     signals = p["STRATEGY"]["entry_signals"]
+    champions = p["STRATEGY"]["champions"]
     if signals:
         sym, sig = next(iter(signals.items()))
         last = Decimal(sig["last_close"])
@@ -60,7 +61,7 @@ def trade_payload(p, **over):
         sym = "BTC/USD"
         market = p["DATA_HEALTH"]["market"]
         last = Decimal(market[sym]["last_price"]) if market else Decimal("30000")
-    return {"symbol": sym, "side": "BUY", "strategy_key": p["STRATEGY"]["champion"], "entry_price": str(last),
+    return {"symbol": sym, "side": "BUY", "strategy_key": (champions.get(sym) or {}).get("key"), "entry_price": str(last),
             "stop_price": str(last * Decimal("0.97")), "thesis": "[MOCK] follow the champion's entry signal",
             "invalidation_condition": "close below the stop", "confidence": 0.5} | over
 
@@ -92,7 +93,7 @@ def until_signal(cp, s, clock, max_hours=300):
         ds = cp.loop.refresh_data(report, clock.now())
         if report.data_ok and cp.loop.reconcile(report):
             marks = cp.loop.update_risk_state(report, ds, clock.now())
-            if any(cp.loop.manage_position(report, sym, d, marks, s.strategies.champion()) for sym, d in ds.items()):
+            if any(cp.loop.manage_position(report, sym, d, marks, s.strategies.champion("BTC/USD", Timeframe.H1)) for sym, d in ds.items()):
                 return
     raise AssertionError("no entry signal reached")
 
@@ -505,14 +506,14 @@ class TestIdempotency:
         from ati.agent.pipeline import Outcome
         report = control_mod.TickReport(0)
         ds = cp.loop.refresh_data(report, clock.now())
-        view = ds["BTC/USD"].view_at(ds["BTC/USD"].candles[-1].close_time, s.strategies.champion().lookback)
+        view = ds["BTC/USD"].view_at(ds["BTC/USD"].candles[-1].close_time, s.strategies.champion("BTC/USD", Timeframe.H1).lookback)
         pf = s.execution.portfolio_snapshot({"BTC/USD": ds["BTC/USD"].candles[-1].close}, cp.loop.day_start_equity,
                                             cp.loop.peak_equity)
         from ati.agent.schema import TradeProposal
         from ati.core.types import Side
-        prop = TradeProposal("BTC/USD", Side.BUY, s.strategies.champion().key, ds["BTC/USD"].candles[-1].close,
+        prop = TradeProposal("BTC/USD", Side.BUY, s.strategies.champion("BTC/USD", Timeframe.H1).key, ds["BTC/USD"].candles[-1].close,
                              ds["BTC/USD"].candles[-1].close * Decimal("0.97"), None, None, "t", "i", 0.5, ())
-        again = s.pipeline.route_proposal(s.strategies.champion(), view, pf, cp.loop._market("BTC/USD", ds["BTC/USD"]), prop)
+        again = s.pipeline.route_proposal(s.strategies.champion("BTC/USD", Timeframe.H1), view, pf, cp.loop._market("BTC/USD", ds["BTC/USD"]), prop)
         assert again.outcome is Outcome.ALREADY_DECIDED and counts(s) == n
 
 

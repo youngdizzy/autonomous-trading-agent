@@ -99,6 +99,8 @@ class StrategyDefinition:
     def __post_init__(self) -> None:
         if not self.strategy_id or not self.strategy_id.replace("_", "").replace("-", "").isalnum():
             raise ValueError(f"invalid strategy_id {self.strategy_id!r}")
+        if not isinstance(self.timeframe, Timeframe):
+            raise ValueError(f"timeframe must be a Timeframe, got {self.timeframe!r} (no implicit default)")
         if not isinstance(self.version, int) or self.version < 1:
             raise ValueError("version must be a positive int")
         if self.kind not in LOGIC_REGISTRY:
@@ -118,7 +120,21 @@ class StrategyDefinition:
 
     @property
     def key(self) -> str:
+        """Behavioural name (strategy id + version). NOT unique across timeframes — never a registry lookup key."""
         return f"{self.strategy_id}@v{self.version}"
+
+    @property
+    def registry_key(self) -> str:
+        """Timeframe deployment identity: the strategy registry's unique key (``trend@v1/1h``)."""
+        return f"{self.strategy_id}@v{self.version}/{self.timeframe.value}"
+
+    @property
+    def behavior_fingerprint(self) -> str:
+        """What the rule *is*, independent of the timeframe it runs on: id, version, kind, params, code. Two
+        deployments of one strategy on 1h and 4h share it. (``definition_hash`` — the strategy fingerprint used for
+        research, promotion and decisions — additionally binds the timeframe and lineage.)"""
+        return sha256_hex({"strategy_id": self.strategy_id, "version": self.version, "kind": self.kind,
+                           "params": [list(p) for p in self.params], "code_hash": self.code_hash})
 
     @property
     def logic(self) -> type[StrategyLogic]:

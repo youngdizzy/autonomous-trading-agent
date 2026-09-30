@@ -42,12 +42,14 @@ class PromotionRecord:
     data_status: str
     policy: PromotionPolicy
     decided_at: datetime
+    symbol: str = ""        # research dimension the decision belongs to (part of the integrity hash)
+    timeframe: str = ""
     record_hash: str = ""
 
     def _body(self) -> str:
         return canonical_json({k: getattr(self, k) for k in (
             "challenger_key", "challenger_hash", "champion_key", "approved", "reasons", "evidence",
-            "data_status", "policy", "decided_at")})
+            "data_status", "policy", "decided_at", "symbol", "timeframe")})
 
     def verify_integrity(self) -> bool:
         return hmac.compare_digest(self.record_hash, hashlib.sha256(self._body().encode()).hexdigest())
@@ -56,8 +58,12 @@ class PromotionRecord:
 def decide_promotion(challenger: StrategyDefinition, champion: StrategyDefinition | None,
                      wf: WalkForwardResult, adversarial: AdversarialReport, holdout: HoldoutEvaluation,
                      champion_wf: WalkForwardResult | None, policy: PromotionPolicy, decided_at: datetime,
-                     journal: Journal) -> PromotionRecord:
+                     journal: Journal, symbol: str = "") -> PromotionRecord:
+    """``symbol`` names the research dimension (with the challenger's timeframe). A record without one can be
+    journaled but never applied: champions exist per (symbol, timeframe) only."""
     reasons: list[str] = []
+    if champion is not None and champion.timeframe is not challenger.timeframe:
+        reasons.append("champion and challenger belong to different timeframes: not comparable")
     h = challenger.definition_hash
     if adversarial.strategy_hash != h or holdout.strategy_hash != h:
         reasons.append("evidence does not belong to this exact challenger definition")
@@ -86,9 +92,10 @@ def decide_promotion(challenger: StrategyDefinition, champion: StrategyDefinitio
             reasons.append("challenger does not beat champion out-of-sample on the same data")
     evidence = (("walk_forward", wf.evidence_hash), ("adversarial", adversarial.evidence_hash),
                 ("holdout", holdout.evidence_hash))
-    record = PromotionRecord(challenger.key, h, champion.key if champion else None, not reasons,
+    record = PromotionRecord(challenger.registry_key, h, champion.registry_key if champion else None, not reasons,
                              tuple(reasons) if reasons else ("all promotion criteria met",), evidence,
-                             adversarial.data_status, policy, ensure_utc(decided_at))
+                             adversarial.data_status, policy, ensure_utc(decided_at), symbol,
+                             challenger.timeframe.value)
     object.__setattr__(record, "record_hash", hashlib.sha256(record._body().encode()).hexdigest())
     journal.append("promotion_decision", {"record": record})
     return record
